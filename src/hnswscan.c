@@ -161,6 +161,8 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 	scan = RelationGetIndexScan(index, nkeys, norderbys);
 
 	so = (HnswScanOpaque) palloc(sizeof(HnswScanOpaqueData));
+	so->range_query = false;
+	so->range_threshold = 0;
 	so->typeInfo = HnswGetTypeInfo(index);
 
 	/* Set support functions */
@@ -215,8 +217,6 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 {
 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
 	MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
-	bool range_query = false;
-	float range_threshold = 0;
 
 	/*
 	 * Index can be used to scan backward, but Postgres doesn't support
@@ -241,7 +241,7 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 			elog(ERROR, "non-MVCC snapshots are not supported with hnsw");
 
 		/* Get scan value */
-		value = GetScanValue(scan, &range_query, &range_threshold);
+		value = GetScanValue(scan, &so->range_query, &so->range_threshold);
 
 		/*
 		 * Get a shared lock. This allows vacuum to ensure no in-flight scans
@@ -315,7 +315,7 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		sc = llast(so->w);
 		element = HnswPtrAccess(base, sc->element);
 
-		if (range_query && sc->distance > range_threshold * range_threshold){
+		if (so->range_query && sc->distance > so->range_threshold * so->range_threshold){
 			MemoryContextSwitchTo(oldCtx);
 			return false;
 		}

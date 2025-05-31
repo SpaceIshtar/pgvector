@@ -375,6 +375,8 @@ typedef struct HnswScanOpaqueData
 	double		previousDistance;
 	Size		maxMemory;
 	MemoryContext tmpCtx;
+	bool 		range_query;
+	float 		range_threshold;
 
 	/* Support functions */
 	HnswSupport support;
