@@ -130,7 +130,7 @@ hnswcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	Relation	index;
 
 	/* Never use index without order */
-	if (path->indexorderbys == NULL)
+	if (path->indexorderbys == NULL && path->indexclauses == NULL)
 	{
 		*indexStartupCost = get_float8_infinity();
 		*indexTotalCost = get_float8_infinity();
@@ -210,11 +210,16 @@ hnswcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		costs.indexStartupCost -= (startupPages - path->indexinfo->rel->pages) * spc_seq_page_cost;
 	}
 
-	*indexStartupCost = costs.indexStartupCost;
-	*indexTotalCost = costs.indexTotalCost;
-	*indexSelectivity = costs.indexSelectivity;
-	*indexCorrelation = costs.indexCorrelation;
-	*indexPages = costs.numIndexPages;
+	// *indexStartupCost = costs.indexStartupCost;
+	// *indexTotalCost = costs.indexTotalCost;
+	// *indexSelectivity = costs.indexSelectivity;
+	// *indexCorrelation = costs.indexCorrelation;
+	// *indexPages = costs.numIndexPages;
+	*indexStartupCost = 0;
+	*indexTotalCost = 0;
+	*indexSelectivity = 1;
+	*indexCorrelation = 1;
+	*indexPages = 0;
 }
 
 /*

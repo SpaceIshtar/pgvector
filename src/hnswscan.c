@@ -1,6 +1,7 @@
 #include "postgres.h"
 
 #include "access/relscan.h"
+#include "executor/executor.h"
 #include "hnsw.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
@@ -79,25 +80,59 @@ ResumeScanItems(IndexScanDesc scan)
  * Get scan value
  */
 static Datum
-GetScanValue(IndexScanDesc scan)
+GetScanValue(IndexScanDesc scan, bool *range_query, float *range_threshold)
 {
 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
 	Datum		value;
+	
+	*range_query = false;
+	*range_threshold = -1;
 
-	if (scan->orderByData->sk_flags & SK_ISNULL)
-		value = PointerGetDatum(NULL);
-	else
-	{
-		value = scan->orderByData->sk_argument;
+	if (scan->orderByData == NULL){
+		if (scan->keyData == NULL){
+			elog(ERROR, "hnsw: one of orderByData and keyData must be not null");
+		}
+		if (scan->keyData->sk_flags & SK_ISNULL){
+			value = PointerGetDatum(NULL);
+		}
+		else{
+			bool isNulls[2];
+			Datum values[2];
+			HeapTupleHeader composite_tuple_header = DatumGetHeapTupleHeader(scan->keyData->sk_argument);
+			values[0] = GetAttributeByName(composite_tuple_header, "threshold", &isNulls[0]);
+			values[1] = GetAttributeByName(composite_tuple_header, "query", &isNulls[1]);
+			if (isNulls[0] || isNulls[1]){
+				elog(ERROR, "range query threshold and vector cannot be null");
+			}
+			*range_query = true;
+			*range_threshold = DatumGetFloat4(values[0]);
+			value = values[1];
+			/* Value should not be compressed or toasted */
+			Assert(!VARATT_IS_COMPRESSED(DatumGetPointer(value)));
+			Assert(!VARATT_IS_EXTENDED(DatumGetPointer(value)));
 
-		/* Value should not be compressed or toasted */
-		Assert(!VARATT_IS_COMPRESSED(DatumGetPointer(value)));
-		Assert(!VARATT_IS_EXTENDED(DatumGetPointer(value)));
-
-		/* Normalize if needed */
-		if (so->support.normprocinfo != NULL)
-			value = HnswNormValue(so->typeInfo, so->support.collation, value);
+			/* Normalize if needed */
+			if (so->support.normprocinfo != NULL)
+				value = HnswNormValue(so->typeInfo, so->support.collation, value);
+		}
 	}
+	else{
+		if (scan->orderByData->sk_flags & SK_ISNULL)
+			value = PointerGetDatum(NULL);
+		else
+		{
+			value = scan->orderByData->sk_argument;
+			
+			/* Value should not be compressed or toasted */
+			Assert(!VARATT_IS_COMPRESSED(DatumGetPointer(value)));
+			Assert(!VARATT_IS_EXTENDED(DatumGetPointer(value)));
+
+			/* Normalize if needed */
+			if (so->support.normprocinfo != NULL)
+				value = HnswNormValue(so->typeInfo, so->support.collation, value);
+		}
+	}
+	
 
 	return value;
 }
@@ -180,6 +215,8 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 {
 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
 	MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
+	bool range_query = false;
+	float range_threshold = 0;
 
 	/*
 	 * Index can be used to scan backward, but Postgres doesn't support
@@ -195,8 +232,8 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		pgstat_count_index_scan(scan->indexRelation);
 
 		/* Safety check */
-		if (scan->orderByData == NULL)
-			elog(ERROR, "cannot scan hnsw index without order");
+		if (scan->orderByData == NULL && scan->keyData == NULL)
+			elog(ERROR, "cannot scan hnsw index without order or where condition");
 
 		/* Requires MVCC-compliant snapshot as not able to maintain a pin */
 		/* https://www.postgresql.org/docs/current/index-locking.html */
@@ -204,7 +241,7 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 			elog(ERROR, "non-MVCC snapshots are not supported with hnsw");
 
 		/* Get scan value */
-		value = GetScanValue(scan);
+		value = GetScanValue(scan, &range_query, &range_threshold);
 
 		/*
 		 * Get a shared lock. This allows vacuum to ensure no in-flight scans
@@ -277,6 +314,11 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 
 		sc = llast(so->w);
 		element = HnswPtrAccess(base, sc->element);
+
+		if (range_query && sc->distance > range_threshold * range_threshold){
+			MemoryContextSwitchTo(oldCtx);
+			return false;
+		}
 
 		/* Move to next element if no valid heap TIDs */
 		if (element->heaptidsLength == 0)

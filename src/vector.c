@@ -7,12 +7,18 @@
 #include "catalog/pg_type.h"
 #include "common/shortest_dec.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "halfutils.h"
 #include "halfvec.h"
 #include "hnsw.h"
 #include "ivfflat.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqformat.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/supportnodes.h"
+#include "optimizer/optimizer.h"
+#include "parser/parse_func.h"
 #include "port.h"				/* for strtof() */
 #include "sparsevec.h"
 #include "utils/array.h"
@@ -1299,4 +1305,245 @@ sparsevec_to_vector(PG_FUNCTION_ARGS)
 		result->x[svec->indices[i]] = values[i];
 
 	PG_RETURN_POINTER(result);
+}
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(range_l2_distance);
+Datum
+range_l2_distance(PG_FUNCTION_ARGS)
+{
+	Vector	   *a = PG_GETARG_VECTOR_P(0);
+	HeapTupleHeader  t = PG_GETARG_HEAPTUPLEHEADER(1);
+	bool isNull;
+	Datum threshold, vecDatum;
+	float dis;
+	Vector *b;
+	threshold = GetAttributeByName(t, "threshold", &isNull);
+	if (isNull){
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("threshold attribute in range_l2_distance is NULL")));
+	}
+	vecDatum = GetAttributeByName(t, "query", &isNull);
+	if (isNull){
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("query attribute in range_l2_distance is NULL")));
+	}
+	b = DatumGetVector(vecDatum);
+	CheckDims(a, b);
+	dis = VectorL2SquaredDistance(a->dim, a->x, b->x);
+	PG_RETURN_BOOL(dis <= DatumGetFloat4(threshold*threshold));
+}
+
+PG_FUNCTION_INFO_V1(ANN_dwithin);
+Datum ANN_dwithin(PG_FUNCTION_ARGS){
+	float dis;
+	Vector *a = PG_GETARG_VECTOR_P(0);
+	Vector *b = PG_GETARG_VECTOR_P(1);
+	float threshold = PG_GETARG_FLOAT4(2);
+	CheckDims(a, b);
+	dis = VectorL2SquaredDistance(a->dim, a->x, b->x);
+	PG_RETURN_BOOL(dis <= threshold * threshold);
+}
+
+PG_FUNCTION_INFO_V1(generate_range_query_params);
+Datum generate_range_query_params(PG_FUNCTION_ARGS)
+{
+	TupleDesc tupdesc;
+	HeapTuple tuple;
+	Datum values[2];
+	float threshold = PG_GETARG_FLOAT4(1);
+    Vector *input_vector = PG_GETARG_VECTOR_P(0);
+	bool nulls[] = {false, false};
+	Vector *output_vector = InitVector(input_vector->dim);
+	for (int i = 0; i < input_vector->dim; i++){
+		output_vector->x[i] = input_vector->x[i];
+	}
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE){
+		ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("function returning record called in context "
+                            "that cannot accept type record")));
+	}
+    BlessTupleDesc(tupdesc);
+	values[0] = Float4GetDatum(threshold);
+	values[1] = PointerGetDatum(output_vector);
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+static Oid
+getGenerateRangeQueryParamsFunctionOid(Oid vectype, Oid callingfunc)
+{
+	const Oid radiustype = FLOAT4OID; /* Should always be FLOAT4OID */
+	const Oid expandfn_args[2] = {vectype, radiustype};
+	const bool noError = true;
+	/* Expand function must be in same namespace as the caller */
+	char *nspname = get_namespace_name(get_func_namespace(callingfunc));
+	List *expandfn_name = list_make2(makeString(nspname), makeString("generaterangequeryparams"));
+	Oid expandfn_oid = LookupFuncName(expandfn_name, 2, expandfn_args, noError);
+	if (expandfn_oid == InvalidOid)
+	{
+		ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("unable to lookup generaterangequeryparams")));
+	}
+	return expandfn_oid;
+}
+
+static Oid
+getRangeQueryParamsTypeOidFromFunction(Oid func_oid)
+{
+    TupleDesc tupdesc = NULL;
+    Oid range_query_params_type_oid = InvalidOid;
+
+    // 2. 通过函数 OID 获取其返回类型的 TupleDesc
+    // 第一个参数 fcinfo 为 NULL，因为我们是在函数外部调用，没有当前的函数调用上下文。
+    // 第二个参数是函数的 OID。
+    // 第三个参数是 TupleDesc 的指针，用于接收结果。
+    if (get_func_result_type(func_oid, &range_query_params_type_oid, &tupdesc) == TYPEFUNC_COMPOSITE)
+    {
+        FreeTupleDesc(tupdesc);
+    }
+    else
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_OBJECT),
+                 errmsg("Could not determine return type of generate_range_query_params function")));
+    }
+
+    return range_query_params_type_oid;
+}
+
+PG_FUNCTION_INFO_V1(range_query_supportfn);
+Datum range_query_supportfn(PG_FUNCTION_ARGS)
+{
+	Node *rawreq = (Node *) PG_GETARG_POINTER(0);
+	Node *ret = NULL;
+
+	if (IsA(rawreq, SupportRequestIndexCondition))
+	{
+		SupportRequestIndexCondition *req = (SupportRequestIndexCondition *) rawreq;
+
+		if (is_funcclause(req->node))	/* ST_Something() */
+		{
+			Node *leftarg, *rightarg, *radiusarg;
+			Oid leftdatatype, rightdatatype, oproid, rangequeryparams_oid, expandfn_oid;
+			Expr *expr;
+			FuncExpr *expandexpr;
+			FuncExpr *clause = (FuncExpr *) req->node;
+			Oid opfamilyoid = req->opfamily; /* OPERATOR FAMILY of the index */
+			
+			int nargs = list_length(clause->args);
+			if (nargs != 3){
+				ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					errmsg("nargs for ANN_DWithin should always to be 3")));
+			}
+			/*
+			* We can only do something with index matches on the first
+			* or second argument.
+			*/
+			if (req->indexarg > 1){
+				ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					errmsg("indexarg for ANN_DWithin should always to be 0 or 1")));
+			}
+
+			/*
+			* Extract "leftarg" as the arg matching
+			* the index and "rightarg" as the other, even if
+			* they were in the opposite order in the call.
+			* NOTE: The functions we deal with here treat
+			* their first two arguments symmetrically
+			* enough that we needn't distinguish between
+			* the two cases beyond this. Could be more
+			* complications in the future.
+			*/
+			if (req->indexarg == 0)
+			{
+				leftarg = linitial(clause->args);
+				rightarg = lsecond(clause->args);
+			}
+			else
+			{
+				rightarg = linitial(clause->args);
+				leftarg = lsecond(clause->args);
+			}
+
+			/*
+			* Need the argument types (which should always be geometry/geography) as
+			* this support function is only ever bound to functions
+			* using those types.
+			*/
+			leftdatatype = exprType(leftarg);
+			rightdatatype = exprType(rightarg);
+
+
+			/*
+			* For the ST_DWithin variants we need to build a more complex return.
+			* We want to expand the non-indexed side of the call by the
+			* radius and then apply the operator.
+			* st_dwithin(g1, g2, radius) yields this, if g1 is the indexarg:
+			* g1 && st_expand(g2, radius)
+			*/
+			
+			radiusarg = (Node *) list_nth(clause->args, 2);
+			expandfn_oid = getGenerateRangeQueryParamsFunctionOid(rightdatatype, clause->funcid);
+			rangequeryparams_oid = getRangeQueryParamsTypeOidFromFunction(expandfn_oid);
+
+			expandexpr = makeFuncExpr(expandfn_oid, rangequeryparams_oid,
+				list_make2(rightarg, radiusarg),
+				InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+
+			/*
+			* The comparison expression has to be a pseudo constant,
+			* (not volatile or dependent on the target index table)
+			*/
+			if (!is_pseudo_constant_for_index(req->root, (Node*)expandexpr, req->index))
+
+			{
+				ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					errmsg("rangequeryparams is not identified as a pseudo-constant for index")));
+			}
+
+			/*
+			* Given the index operator family and the arguments and the
+			* desired strategy number we can now lookup the operator
+			* we want (usually && or &&&).
+			*/
+			oproid = get_opfamily_member(opfamilyoid,
+								leftdatatype,
+								rangequeryparams_oid,
+								2);
+			if (!OidIsValid(oproid))
+				elog(ERROR,
+						"no operator found: opfamily %u type (%d, %d) strategy 2",
+						opfamilyoid,
+						leftdatatype,
+						rangequeryparams_oid
+					);
+
+			/* OK, we can make an index expression */
+			expr = make_opclause(oproid, BOOLOID, false,
+							(Expr *) leftarg, (Expr *) expandexpr,
+							InvalidOid, InvalidOid);
+
+			ret = (Node *)(list_make1(expr));
+			
+
+			/*
+			* Set the lossy field on the SupportRequestIndexCondition parameter
+			* to indicate that the index alone is not sufficient to evaluate
+			* the condition. The function must also still be applied.
+			*/
+			req->lossy = false;
+
+			PG_RETURN_POINTER(ret);
+		}	
+		
+	}
+
+	PG_RETURN_POINTER(ret);
 }

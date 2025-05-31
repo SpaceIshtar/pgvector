@@ -29,6 +29,11 @@ CREATE TYPE vector (
 	STORAGE   = external
 );
 
+CREATE TYPE range_query_params AS (
+	threshold float4,
+	query vector
+);
+
 -- vector functions
 
 CREATE FUNCTION l2_distance(vector, vector) RETURNS float8
@@ -170,6 +175,30 @@ CREATE CAST (numeric[] AS vector)
 	WITH FUNCTION array_to_vector(numeric[], integer, boolean) AS ASSIGNMENT;
 
 -- vector operators
+
+CREATE FUNCTION range_l2_distance(vector, range_query_params) RETURNS bool
+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE OPERATOR <<->> (
+	LEFTARG = vector, RIGHTARG = range_query_params, PROCEDURE = range_l2_distance,
+	COMMUTATOR = '<<->>'
+);
+
+CREATE OR REPLACE FUNCTION GenerateRangeQueryParams(vector, float4)
+	RETURNS range_query_params
+	AS 'MODULE_PATHNAME', 'generate_range_query_params'
+	LANGUAGE 'c' IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE OR REPLACE FUNCTION range_query_supportfn (internal)
+	RETURNS internal
+	AS 'MODULE_PATHNAME', 'range_query_supportfn'
+	LANGUAGE 'c';
+
+CREATE OR REPLACE FUNCTION ANN_DWithin(vec1 vector, vec2 vector, threshold float4)
+	RETURNS boolean
+	AS 'MODULE_PATHNAME', 'ANN_dwithin'
+	SUPPORT range_query_supportfn
+	LANGUAGE 'c' IMMUTABLE STRICT PARALLEL SAFE;
 
 CREATE OPERATOR <-> (
 	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = l2_distance,
@@ -313,6 +342,7 @@ CREATE OPERATOR CLASS vector_cosine_ops
 CREATE OPERATOR CLASS vector_l2_ops
 	FOR TYPE vector USING hnsw AS
 	OPERATOR 1 <-> (vector, vector) FOR ORDER BY float_ops,
+	OPERATOR 2 <<->> (vector, range_query_params),
 	FUNCTION 1 vector_l2_squared_distance(vector, vector);
 
 CREATE OPERATOR CLASS vector_ip_ops
