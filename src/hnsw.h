@@ -11,6 +11,7 @@
 #include "utils/relptr.h"
 #include "utils/sampling.h"
 #include "vector.h"
+#include "hooks.h"
 
 #define HNSW_MAX_DIM 2000
 #define HNSW_MAX_NNZ 1000
@@ -420,6 +421,8 @@ Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
 void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
 List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
+List	   *HnswSearchLayerWithBitmap(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, itempointer_hash *bitmap, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
+List	   *HnswPushDownSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, hook_evaluateTID evaluate_func, ExprState *qual, ExprContext *econtext, IndexScanDesc scan);
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
@@ -459,6 +462,8 @@ IndexScanDesc hnswbeginscan(Relation index, int nkeys, int norderbys);
 void		hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
 bool		hnswgettuple(IndexScanDesc scan, ScanDirection dir);
 void		hnswendscan(IndexScanDesc scan);
+bool		hnswbitmapsearch(itempointer_hash* bitmap, IndexScanDesc scan, ScanDirection direction);
+bool		hnswpushdownsearch(IndexScanDesc scan, ScanDirection direction, hook_evaluateTID evaluate, ExprState *qual, ExprContext  *econtext);
 
 static inline HnswNeighborArray *
 HnswGetNeighbors(char *base, HnswElement element, int lc)

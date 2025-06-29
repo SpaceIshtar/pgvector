@@ -5,11 +5,13 @@
 #include "bitutils.h"
 #include "bitvec.h"
 #include "catalog/pg_type.h"
+#include "commands/defrem.h"
 #include "common/shortest_dec.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "halfutils.h"
 #include "halfvec.h"
+#include "hooks.h"
 #include "hnsw.h"
 #include "ivfflat.h"
 #include "lib/stringinfo.h"
@@ -18,6 +20,8 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/pathnode.h"
+#include "optimizer/paths.h"
 #include "parser/parse_func.h"
 #include "port.h"				/* for strtof() */
 #include "sparsevec.h"
@@ -54,6 +58,11 @@ _PG_init(void)
 	HalfvecInit();
 	HnswInit();
 	IvfflatInit();
+	register_hook();
+}
+
+void _PG_fini(void){
+	unregister_hook();
 }
 
 /*

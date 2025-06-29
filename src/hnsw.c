@@ -210,16 +210,16 @@ hnswcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		costs.indexStartupCost -= (startupPages - path->indexinfo->rel->pages) * spc_seq_page_cost;
 	}
 
-	// *indexStartupCost = costs.indexStartupCost;
-	// *indexTotalCost = costs.indexTotalCost;
-	// *indexSelectivity = costs.indexSelectivity;
-	// *indexCorrelation = costs.indexCorrelation;
-	// *indexPages = costs.numIndexPages;
-	*indexStartupCost = 0;
-	*indexTotalCost = 0;
-	*indexSelectivity = 1;
-	*indexCorrelation = 1;
-	*indexPages = 0;
+	*indexStartupCost = costs.indexStartupCost;
+	*indexTotalCost = costs.indexTotalCost;
+	*indexSelectivity = costs.indexSelectivity;
+	*indexCorrelation = costs.indexCorrelation;
+	*indexPages = costs.numIndexPages;
+	// *indexStartupCost = 0;
+	// *indexTotalCost = 0;
+	// *indexSelectivity = 1;
+	// *indexCorrelation = 1;
+	// *indexPages = 0;
 }
 
 /*

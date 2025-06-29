@@ -3,6 +3,7 @@
 #include "access/relscan.h"
 #include "executor/executor.h"
 #include "hnsw.h"
+#include "hooks.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -319,6 +320,420 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 			MemoryContextSwitchTo(oldCtx);
 			return false;
 		}
+
+		/* Move to next element if no valid heap TIDs */
+		if (element->heaptidsLength == 0)
+		{
+			so->w = list_delete_last(so->w);
+
+			/* Mark memory as free for next iteration */
+			if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
+			{
+				pfree(element);
+				pfree(sc);
+			}
+
+			continue;
+		}
+
+		heaptid = &element->heaptids[--element->heaptidsLength];
+
+		if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_STRICT)
+		{
+			if (sc->distance < so->previousDistance)
+				continue;
+
+			so->previousDistance = sc->distance;
+		}
+
+		MemoryContextSwitchTo(oldCtx);
+
+		scan->xs_heaptid = *heaptid;
+		scan->xs_recheck = false;
+		scan->xs_recheckorderby = false;
+		return true;
+	}
+
+	MemoryContextSwitchTo(oldCtx);
+	return false;
+}
+
+static List *
+GetBitmapScanItems(itempointer_hash* bitmap, IndexScanDesc scan, Datum value)
+{
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	Relation	index = scan->indexRelation;
+	HnswSupport *support = &so->support;
+	List	   *ep;
+	List	   *w;
+	int			m;
+	HnswElement entryPoint;
+	char	   *base = NULL;
+	HnswQuery  *q = &so->q;
+
+	/* Get m and entry point */
+	HnswGetMetaPageInfo(index, &m, &entryPoint);
+
+	q->value = value;
+	so->m = m;
+
+	if (entryPoint == NULL)
+		return NIL;
+
+	ep = list_make1(HnswEntryCandidate(base, entryPoint, q, index, support, false));
+
+	for (int lc = entryPoint->level; lc >= 1; lc--)
+	{
+		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL);
+		ep = w;
+	}
+
+	return HnswSearchLayerWithBitmap(base, q, ep, hnsw_ef_search, 0, index, support, m, bitmap, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples);
+}
+
+static List *
+ResumeBitmapScanItems(itempointer_hash* bitmap, IndexScanDesc scan)
+{
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	Relation	index = scan->indexRelation;
+	List	   *ep = NIL;
+	char	   *base = NULL;
+	int			batch_size = hnsw_ef_search;
+
+	if (pairingheap_is_empty(so->discarded))
+		return NIL;
+
+	/* Get next batch of candidates */
+	for (int i = 0; i < batch_size; i++)
+	{
+		HnswSearchCandidate *sc;
+
+		if (pairingheap_is_empty(so->discarded))
+			break;
+
+		sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded));
+
+		ep = lappend(ep, sc);
+	}
+
+	return HnswSearchLayerWithBitmap(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, bitmap, false, NULL, &so->v, &so->discarded, false, &so->tuples);
+}
+
+bool hnswbitmapsearch(itempointer_hash* bitmap, IndexScanDesc scan, ScanDirection direction)
+{	
+	/* Only traverse data points that satisfies bitmap*/
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
+
+	/*
+	 * Index can be used to scan backward, but Postgres doesn't support
+	 * backward scan on operators
+	 */
+	Assert(ScanDirectionIsForward(dir));
+
+	if (so->first)
+	{
+		Datum		value;
+
+		/* Count index scan for stats */
+		pgstat_count_index_scan(scan->indexRelation);
+
+		/* Safety check */
+		if (scan->orderByData == NULL && scan->keyData == NULL)
+			elog(ERROR, "cannot scan hnsw index without order or where condition");
+
+		/* Requires MVCC-compliant snapshot as not able to maintain a pin */
+		/* https://www.postgresql.org/docs/current/index-locking.html */
+		if (!IsMVCCSnapshot(scan->xs_snapshot))
+			elog(ERROR, "non-MVCC snapshots are not supported with hnsw");
+
+		/* Get scan value */
+		value = GetScanValue(scan, &so->range_query, &so->range_threshold);
+
+		/*
+		 * Get a shared lock. This allows vacuum to ensure no in-flight scans
+		 * before marking tuples as deleted.
+		 */
+		LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+		so->w = GetBitmapScanItems(bitmap, scan, value);
+
+		/* Release shared lock */
+		UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+		so->first = false;
+
+#if defined(HNSW_MEMORY)
+		ShowMemoryUsage(so);
+#endif
+	}
+
+	for (;;)
+	{
+		char	   *base = NULL;
+		HnswSearchCandidate *sc;
+		HnswElement element;
+		ItemPointer heaptid;
+
+		if (list_length(so->w) == 0)
+		{
+			if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_OFF)
+				break;
+
+			/* Empty index */
+			if (so->discarded == NULL)
+				break;
+
+			/* Reached max number of tuples or memory limit */
+			if (so->tuples >= hnsw_max_scan_tuples || MemoryContextMemAllocated(so->tmpCtx, false) > so->maxMemory)
+			{
+				if (pairingheap_is_empty(so->discarded))
+					break;
+
+				/* Return remaining tuples */
+				so->w = lappend(so->w, HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded)));
+			}
+			else
+			{
+				/*
+				 * Locking ensures when neighbors are read, the elements they
+				 * reference will not be deleted (and replaced) during the
+				 * iteration.
+				 *
+				 * Elements loaded into memory on previous iterations may have
+				 * been deleted (and replaced), so when reading neighbors, the
+				 * element version must be checked.
+				 */
+				LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+				so->w = ResumeBitmapScanItems(bitmap, scan);
+
+				UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+#if defined(HNSW_MEMORY)
+				ShowMemoryUsage(so);
+#endif
+			}
+
+			if (list_length(so->w) == 0)
+				break;
+		}
+
+		sc = llast(so->w);
+		element = HnswPtrAccess(base, sc->element);
+
+		if (so->range_query && sc->distance > so->range_threshold * so->range_threshold){
+			MemoryContextSwitchTo(oldCtx);
+			return false;
+		}
+
+		Assert(element->heaptidsLength <= 1);
+
+		/* Move to next element if no valid heap TIDs */
+		if (element->heaptidsLength == 0)
+		{
+			so->w = list_delete_last(so->w);
+
+			/* Mark memory as free for next iteration */
+			if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
+			{
+				pfree(element);
+				pfree(sc);
+			}
+
+			continue;
+		}
+
+		heaptid = &element->heaptids[--element->heaptidsLength];
+
+		if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_STRICT)
+		{
+			if (sc->distance < so->previousDistance)
+				continue;
+
+			so->previousDistance = sc->distance;
+		}
+
+		MemoryContextSwitchTo(oldCtx);
+
+		scan->xs_heaptid = *heaptid;
+		scan->xs_recheck = false;
+		scan->xs_recheckorderby = false;
+		return true;
+	}
+
+	MemoryContextSwitchTo(oldCtx);
+	return false;
+}
+
+static List *GetPushDownScanItems(IndexScanDesc scan, Datum value, hook_evaluateTID evaluate_func, ExprState *qual, ExprContext *econtext)
+{
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	Relation	index = scan->indexRelation;
+	HnswSupport *support = &so->support;
+	List	   *ep;
+	List	   *w;
+	int			m;
+	HnswElement entryPoint;
+	char	   *base = NULL;
+	HnswQuery  *q = &so->q;
+
+	/* Get m and entry point */
+	HnswGetMetaPageInfo(index, &m, &entryPoint);
+
+	q->value = value;
+	so->m = m;
+
+	if (entryPoint == NULL)
+		return NIL;
+
+	ep = list_make1(HnswEntryCandidate(base, entryPoint, q, index, support, false));
+
+	for (int lc = entryPoint->level; lc >= 1; lc--)
+	{
+		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL);
+		ep = w;
+	}
+
+	return HnswPushDownSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, evaluate_func, qual, econtext, scan);
+}
+
+static List *ResumePushDownScanItems(IndexScanDesc scan, hook_evaluateTID evaluate_func, ExprState *qual, ExprContext *econtext)
+{
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	Relation	index = scan->indexRelation;
+	List	   *ep = NIL;
+	char	   *base = NULL;
+	int			batch_size = hnsw_ef_search;
+
+	if (pairingheap_is_empty(so->discarded))
+		return NIL;
+
+	/* Get next batch of candidates */
+	for (int i = 0; i < batch_size; i++)
+	{
+		HnswSearchCandidate *sc;
+
+		if (pairingheap_is_empty(so->discarded))
+			break;
+
+		sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded));
+
+		ep = lappend(ep, sc);
+	}
+
+	return HnswPushDownSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples, evaluate_func, qual, econtext, scan);
+}
+
+bool		hnswpushdownsearch(IndexScanDesc scan, ScanDirection direction, hook_evaluateTID evaluate, ExprState *qual, ExprContext  *econtext)
+{
+	/* Only traverse data points that satisfies bitmap*/
+	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+	MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
+
+	/*
+	 * Index can be used to scan backward, but Postgres doesn't support
+	 * backward scan on operators
+	 */
+	Assert(ScanDirectionIsForward(dir));
+
+	if (so->first)
+	{
+		Datum		value;
+
+		/* Count index scan for stats */
+		pgstat_count_index_scan(scan->indexRelation);
+
+		/* Safety check */
+		if (scan->orderByData == NULL && scan->keyData == NULL)
+			elog(ERROR, "cannot scan hnsw index without order or where condition");
+
+		/* Requires MVCC-compliant snapshot as not able to maintain a pin */
+		/* https://www.postgresql.org/docs/current/index-locking.html */
+		if (!IsMVCCSnapshot(scan->xs_snapshot))
+			elog(ERROR, "non-MVCC snapshots are not supported with hnsw");
+
+		/* Get scan value */
+		value = GetScanValue(scan, &so->range_query, &so->range_threshold);
+
+		/*
+		 * Get a shared lock. This allows vacuum to ensure no in-flight scans
+		 * before marking tuples as deleted.
+		 */
+		LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+		so->w = GetPushDownScanItems(scan, value, evaluate, qual, econtext);
+
+		/* Release shared lock */
+		UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+		so->first = false;
+
+#if defined(HNSW_MEMORY)
+		ShowMemoryUsage(so);
+#endif
+	}
+
+	for (;;)
+	{
+		char	   *base = NULL;
+		HnswSearchCandidate *sc;
+		HnswElement element;
+		ItemPointer heaptid;
+
+		if (list_length(so->w) == 0)
+		{
+			if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_OFF)
+				break;
+
+			/* Empty index */
+			if (so->discarded == NULL)
+				break;
+
+			/* Reached max number of tuples or memory limit */
+			if (so->tuples >= hnsw_max_scan_tuples || MemoryContextMemAllocated(so->tmpCtx, false) > so->maxMemory)
+			{
+				if (pairingheap_is_empty(so->discarded))
+					break;
+
+				/* Return remaining tuples */
+				so->w = lappend(so->w, HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded)));
+			}
+			else
+			{
+				/*
+				 * Locking ensures when neighbors are read, the elements they
+				 * reference will not be deleted (and replaced) during the
+				 * iteration.
+				 *
+				 * Elements loaded into memory on previous iterations may have
+				 * been deleted (and replaced), so when reading neighbors, the
+				 * element version must be checked.
+				 */
+				LockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+				so->w = ResumePushDownScanItems(scan, evaluate, qual, econtext);
+
+				UnlockPage(scan->indexRelation, HNSW_SCAN_LOCK, ShareLock);
+
+#if defined(HNSW_MEMORY)
+				ShowMemoryUsage(so);
+#endif
+			}
+
+			if (list_length(so->w) == 0)
+				break;
+		}
+
+		sc = llast(so->w);
+		element = HnswPtrAccess(base, sc->element);
+
+		if (so->range_query && sc->distance > so->range_threshold * so->range_threshold){
+			MemoryContextSwitchTo(oldCtx);
+			return false;
+		}
+
+		Assert(element->heaptidsLength <= 1);
 
 		/* Move to next element if no valid heap TIDs */
 		if (element->heaptidsLength == 0)

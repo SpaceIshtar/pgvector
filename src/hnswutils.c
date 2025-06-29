@@ -8,6 +8,7 @@
 #include "common/hashfn.h"
 #include "fmgr.h"
 #include "hnsw.h"
+#include "hooks.h"
 #include "lib/pairingheap.h"
 #include "sparsevec.h"
 #include "storage/bufmgr.h"
@@ -961,6 +962,398 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 						pairingheap_add(*discarded, &d->w_node);
 				}
 			}
+		}
+	}
+
+	/* Add each element of W to w */
+	while (!pairingheap_is_empty(W))
+	{
+		HnswSearchCandidate *sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+
+		w = lappend(w, sc);
+	}
+
+	return w;
+}
+
+/*
+ * Algorithm 2 from paper
+ */
+List *
+HnswSearchLayerWithBitmap(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, itempointer_hash *bitmap, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples)
+{
+	List	   *w = NIL;
+	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
+	pairingheap *W = pairingheap_allocate(CompareFurthestCandidates, NULL);
+	int			wlen = 0;
+	visited_hash vh;
+	ListCell   *lc2;
+	HnswNeighborArray *localNeighborhood = NULL;
+	Size		neighborhoodSize = 0;
+	int			lm = HnswGetLayerM(m, lc);
+	HnswUnvisited *unvisited = palloc(lm * sizeof(HnswUnvisited));
+	int			unvisitedLength;
+	bool		inMemory = index == NULL;
+
+	if (v == NULL)
+	{
+		v = &vh;
+		initVisited = true;
+	}
+
+	if (initVisited)
+	{
+		InitVisited(base, v, inMemory, ef, m);
+
+		if (discarded != NULL)
+			*discarded = pairingheap_allocate(CompareNearestDiscardedCandidates, NULL);
+	}
+
+	/* Create local memory for neighborhood if needed */
+	if (inMemory)
+	{
+		neighborhoodSize = HNSW_NEIGHBOR_ARRAY_SIZE(lm);
+		localNeighborhood = palloc(neighborhoodSize);
+	}
+
+	/* Add entry points to v, C, and W */
+	foreach(lc2, ep)
+	{
+		HnswSearchCandidate *sc = (HnswSearchCandidate *) lfirst(lc2);
+		HnswElement			entryPoint = HnswPtrAccess(base, sc->element);
+		bool		found;
+
+		if (initVisited)
+		{
+			AddToVisited(base, v, sc->element, inMemory, &found);
+
+			/* OK to count elements instead of tuples */
+			if (tuples != NULL)
+				(*tuples)++;
+		}
+
+		pairingheap_add(C, &sc->c_node);
+		if (itempointer_lookup(bitmap, entryPoint->heaptids[0]))
+		{
+			pairingheap_add(W, &sc->w_node);
+			/*
+			* Do not count elements being deleted towards ef when vacuuming. It
+			* would be ideal to do this for inserts as well, but this could
+			* affect insert performance.
+			*/
+			if (CountElement(skipElement, HnswPtrAccess(base, sc->element)))
+				wlen++;
+		}
+		
+
+		
+	}
+
+	while (!pairingheap_is_empty(C))
+	{
+		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
+		HnswSearchCandidate *f = NULL;
+		HnswElement cElement;
+
+		if (!pairingheap_is_empty(W))
+		{
+			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+		}
+
+		if (f && c->distance > f->distance)
+			break;
+
+		cElement = HnswPtrAccess(base, c->element);
+
+		if (inMemory)
+			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize);
+		else
+			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc);
+
+		/* OK to count elements instead of tuples */
+		if (tuples != NULL)
+			(*tuples) += unvisitedLength;
+
+		for (int i = 0; i < unvisitedLength; i++)
+		{
+			HnswElement eElement;
+			HnswSearchCandidate *e;
+			double		eDistance;
+			bool		alwaysAdd = wlen < ef;
+
+
+			if (!pairingheap_is_empty(W))
+			{
+				f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+			}
+
+			if (inMemory)
+			{
+				eElement = unvisited[i].element;
+				eDistance = GetElementDistance(base, eElement, q, support);
+			}
+			else
+			{
+				ItemPointer indextid = &unvisited[i].indextid;
+				BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
+				OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
+
+				/* Avoid any allocations if not adding */
+				eElement = NULL;
+				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
+
+				if (eElement == NULL)
+					continue;
+			}
+
+			if (eElement == NULL || !((f && eDistance < f->distance) || alwaysAdd))
+			{
+				if (discarded != NULL)
+				{
+					/* Create a new candidate */
+					e = HnswInitSearchCandidate(base, eElement, eDistance);
+					pairingheap_add(*discarded, &e->w_node);
+				}
+
+				continue;
+			}
+
+			/* Make robust to issues */
+			if (eElement->level < lc)
+				continue;
+
+			/* Create a new candidate */
+			e = HnswInitSearchCandidate(base, eElement, eDistance);
+			pairingheap_add(C, &e->c_node);
+
+			/*
+			 * Do not count elements being deleted towards ef when vacuuming.
+			 * It would be ideal to do this for inserts as well, but this
+			 * could affect insert performance.
+			 */
+			if (itempointer_lookup(bitmap, eElement->heaptids[0]))
+			{
+				pairingheap_add(W, &e->w_node);
+				if (CountElement(skipElement, eElement))
+				{
+					wlen++;
+
+					/* No need to decrement wlen */
+					if (wlen > ef)
+					{
+						HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+
+						if (discarded != NULL)
+							pairingheap_add(*discarded, &d->w_node);
+					}
+				}
+			}
+			
+		}
+	}
+
+	/* Add each element of W to w */
+	while (!pairingheap_is_empty(W))
+	{
+		HnswSearchCandidate *sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+
+		w = lappend(w, sc);
+	}
+
+	return w;
+}
+
+List *
+HnswPushDownSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, hook_evaluateTID evaluate_func, ExprState *qual, ExprContext *econtext, IndexScanDesc scan)
+{
+	List	   *w = NIL;
+	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
+	pairingheap *W = pairingheap_allocate(CompareFurthestCandidates, NULL);
+	int			wlen = 0;
+	visited_hash vh;
+	ListCell   *lc2;
+	HnswNeighborArray *localNeighborhood = NULL;
+	Size		neighborhoodSize = 0;
+	int			lm = HnswGetLayerM(m, lc);
+	HnswUnvisited *unvisited = palloc(lm * sizeof(HnswUnvisited));
+	int			unvisitedLength;
+	bool		inMemory = index == NULL;
+
+	int 		length = 0;
+	ItemPointer *reserved_itempointer_list = palloc0(sizeof(ItemPointer)*lm);
+	bool		*reserved_result_list = palloc0(sizeof(ItemPointer)*lm);
+	HnswSearchCandidate **reserved_candidate_lists = palloc0(sizeof(HnswSearchCandidate*)*lm);
+
+	if (v == NULL)
+	{
+		v = &vh;
+		initVisited = true;
+	}
+
+	if (initVisited)
+	{
+		InitVisited(base, v, inMemory, ef, m);
+
+		if (discarded != NULL)
+			*discarded = pairingheap_allocate(CompareNearestDiscardedCandidates, NULL);
+	}
+
+	/* Create local memory for neighborhood if needed */
+	if (inMemory)
+	{
+		neighborhoodSize = HNSW_NEIGHBOR_ARRAY_SIZE(lm);
+		localNeighborhood = palloc(neighborhoodSize);
+	}
+
+	/* Add entry points to v, C, and W */
+	foreach(lc2, ep)
+	{
+		HnswSearchCandidate *sc = (HnswSearchCandidate *) lfirst(lc2);
+		HnswElement			entryPoint = HnswPtrAccess(base, sc->element);
+		bool		found;
+
+		if (initVisited)
+		{
+			AddToVisited(base, v, sc->element, inMemory, &found);
+
+			/* OK to count elements instead of tuples */
+			if (tuples != NULL)
+				(*tuples)++;
+		}
+
+		pairingheap_add(C, &sc->c_node);
+		reserved_itempointer_list[length] = &entryPoint->heaptids[0];
+		reserved_result_list[length] = false;
+		reserved_candidate_lists[length] = sc;
+		length++;
+		// if (itempointer_lookup(bitmap, entryPoint->heaptids[0]))
+		// {
+		// 	pairingheap_add(W, &sc->w_node);
+		// 	/*
+		// 	* Do not count elements being deleted towards ef when vacuuming. It
+		// 	* would be ideal to do this for inserts as well, but this could
+		// 	* affect insert performance.
+		// 	*/
+		// 	if (CountElement(skipElement, HnswPtrAccess(base, sc->element)))
+		// 		wlen++;
+		// }
+	}
+
+	evaluate_func(reserved_itempointer_list, reserved_result_list, length, scan, qual, econtext);
+	for (int i = 0; i < length; i++)
+	{
+		if (reserved_result_list[i])
+		{
+			pairingheap_add(W, &reserved_candidate_lists[i]->w_node);
+			wlen++;
+		}
+	}
+
+	while (!pairingheap_is_empty(C))
+	{
+		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
+		HnswSearchCandidate *f = NULL;
+		HnswElement cElement;
+
+		if (!pairingheap_is_empty(W))
+		{
+			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+		}
+
+		if (f && c->distance > f->distance)
+			break;
+
+		cElement = HnswPtrAccess(base, c->element);
+
+		if (inMemory)
+			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize);
+		else
+			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc);
+
+		/* OK to count elements instead of tuples */
+		if (tuples != NULL)
+			(*tuples) += unvisitedLength;
+
+		length = 0;
+		for (int i = 0; i < unvisitedLength; i++)
+		{
+			HnswElement eElement = NULL;
+			ItemPointer indextid = &unvisited[i].indextid;
+			BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
+			OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
+			HnswLoadElementImpl(blkno, offno, NULL, q, index, support, true, NULL, &eElement);
+			unvisited[i].element = eElement;
+			reserved_itempointer_list[length] = &eElement->heaptids[0];
+			reserved_result_list[length] = false;
+			length++;
+		}
+		evaluate_func(reserved_itempointer_list, reserved_result_list, length, scan, qual, econtext);
+
+		for (int i = 0; i < unvisitedLength; i++)
+		{
+			HnswElement eElement;
+			HnswSearchCandidate *e;
+			double		eDistance;
+			bool		alwaysAdd = wlen < ef;
+
+			if (!reserved_result_list[i])
+			{
+				continue;
+			}
+
+
+			if (!pairingheap_is_empty(W))
+			{
+				f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+			}
+
+			
+			eElement = unvisited[i].element;
+			eDistance = GetElementDistance(base, eElement, q, support);
+			
+
+			if (eElement == NULL || !((f && eDistance < f->distance) || alwaysAdd))
+			{
+				if (discarded != NULL)
+				{
+					/* Create a new candidate */
+					e = HnswInitSearchCandidate(base, eElement, eDistance);
+					pairingheap_add(*discarded, &e->w_node);
+				}
+
+				continue;
+			}
+
+			/* Make robust to issues */
+			if (eElement->level < lc)
+				continue;
+
+			/* Create a new candidate */
+			e = HnswInitSearchCandidate(base, eElement, eDistance);
+			pairingheap_add(C, &e->c_node);
+
+			/*
+			 * Do not count elements being deleted towards ef when vacuuming.
+			 * It would be ideal to do this for inserts as well, but this
+			 * could affect insert performance.
+			 */
+			
+			pairingheap_add(W, &e->w_node);
+			if (CountElement(skipElement, eElement))
+			{
+				wlen++;
+
+				/* No need to decrement wlen */
+				if (wlen > ef)
+				{
+					HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+
+					if (discarded != NULL)
+						pairingheap_add(*discarded, &d->w_node);
+				}
+			}
+			
+		
 		}
 	}
 
