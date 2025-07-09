@@ -1100,10 +1100,20 @@ HnswSearchLayerWithBitmap(char *base, HnswQuery * q, List *ep, int ef, int lc, R
 
 				/* Avoid any allocations if not adding */
 				eElement = NULL;
-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
+				HnswLoadElementImpl(blkno, offno, NULL, q, index, support, true, NULL, &eElement);
 
 				if (eElement == NULL)
 					continue;
+			}
+
+			if (!itempointer_lookup(bitmap, eElement->heaptids[0]))
+			{
+				continue;
+			}
+
+			if (!inMemory)
+			{
+				eDistance = GetElementDistance(base, eElement, q, support);
 			}
 
 			if (eElement == NULL || !((f && eDistance < f->distance) || alwaysAdd))
@@ -1131,23 +1141,22 @@ HnswSearchLayerWithBitmap(char *base, HnswQuery * q, List *ep, int ef, int lc, R
 			 * It would be ideal to do this for inserts as well, but this
 			 * could affect insert performance.
 			 */
-			if (itempointer_lookup(bitmap, eElement->heaptids[0]))
+			
+			pairingheap_add(W, &e->w_node);
+			if (CountElement(skipElement, eElement))
 			{
-				pairingheap_add(W, &e->w_node);
-				if (CountElement(skipElement, eElement))
+				wlen++;
+
+				/* No need to decrement wlen */
+				if (wlen > ef)
 				{
-					wlen++;
+					HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
 
-					/* No need to decrement wlen */
-					if (wlen > ef)
-					{
-						HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
-
-						if (discarded != NULL)
-							pairingheap_add(*discarded, &d->w_node);
-					}
+					if (discarded != NULL)
+						pairingheap_add(*discarded, &d->w_node);
 				}
 			}
+			
 			
 		}
 	}

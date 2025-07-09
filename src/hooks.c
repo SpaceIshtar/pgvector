@@ -1,3 +1,4 @@
+#include <time.h>
 #include "postgres.h"
 
 #include "hooks.h"
@@ -16,27 +17,43 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/restrictinfo.h"
 #include "utils/rel.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
+#if PG_VERSION_NUM < 170000
+static inline uint64
+hook_murmurhash64(uint64 data)
+{
+	uint64		h = data;
+
+	h ^= h >> 33;
+	h *= 0xff51afd7ed558ccd;
+	h ^= h >> 33;
+	h *= 0xc4ceb9fe1a85ec53;
+	h ^= h >> 33;
+
+	return h;
+}
+#endif
+
 static uint32
 hash_itempointer(ItemPointerData tid)
 {
 	union
 	{
-		uint32		i[2];
+		uint64		i;
 		ItemPointerData tid;
 	}			x;
 
 	/* Initialize unused bytes */
-	x.i[0] = 0;
-    x.i[1] = 0;
+	x.i = 0;
 	x.tid = tid;
 
-	return hash_combine(murmurhash32(x.i[0]), murmurhash32(x.i[1]));
+	return hook_murmurhash64(x.i);
 }
 
 #define SH_PREFIX		itempointer
@@ -568,11 +585,46 @@ static CustomPath* generate_push_down_path(PlannerInfo  *root, RelOptInfo   *rel
     return pathnode;
 }
 
+static RelOptInfo* copy_rel(RelOptInfo *origin)
+{
+    RelOptInfo *rel = makeNode(RelOptInfo);
+    memcpy(rel, origin, sizeof(RelOptInfo));
+    rel->pathlist = NIL;
+    return rel;
+}
+
+static List* generate_prefilter_paths(PlannerInfo *root, RelOptInfo *rel)
+{
+    List* result_list = NIL, *temp_list = NIL;
+    ListCell *p1;
+    RelOptInfo *newrel = copy_rel(rel);
+    create_index_paths(root, newrel);
+    temp_list = newrel->pathlist;
+    foreach(p1, temp_list)
+    {
+        Path *path = (Path *) lfirst(p1);
+        if (!IsA(path, IndexPath))
+        {
+            result_list = lappend(result_list, path);
+        }
+        else
+        {
+            IndexPath* ipath = (IndexPath*)path;
+            if (ipath->indexclauses && !ipath->indexorderbys){
+                result_list = lappend(result_list, path);
+            }
+        }
+    }
+    return result_list;
+}
+
 /* Core Function to generate a CustomPath*/
 void set_custom_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte)
 {   
     bool    hasOrderByVector, hasWhereVector;
+    ListCell    *lc;
     Path    *seqPath = NULL, *indexPath = NULL, *push_down_path = NULL;
+    List    *prefilterPaths = NIL;
     CustomPath  *bitmapIndexPath = NULL;
     List    *orderByVectorClauses = NIL, *orderByOtherClauses = NIL, *vectorPathkeys = NIL;
     Relids  required_outer = rel->lateral_relids;
@@ -595,9 +647,11 @@ void set_custom_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, Rang
         return;
     }
     
-    /* Case 1: bitmap + heapscan (seq scan) */
+    /* Case 0: seq scan */
     seqPath = create_seqscan_path(root, rel, required_outer, 0);
-    // TODO: change the estimated cost of sequential scan
+    
+    /* Case 1: Pre-filtering*/
+    prefilterPaths = generate_prefilter_paths(root, rel);
     
     /* Case 2: IndexScan + post-filtering*/
     indexPath = (Path*) generate_index_path(root, rel, orderByVectorClauses, vectorPathkeys);
@@ -620,13 +674,6 @@ void set_custom_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, Rang
      * set the cost of the path we want to test to be small.
      */
 
-    // if (bitmapIndexPath){
-    //     bitmapIndexPath->path.rows = 10;
-    //     bitmapIndexPath->path.startup_cost = 0.1;
-    //     bitmapIndexPath->path.total_cost = 1;
-    //     add_path(rel, (Path*) bitmapIndexPath);
-    // }
-
     // if (seqPath)
     // {
     //     seqPath->rows = 10;
@@ -635,12 +682,28 @@ void set_custom_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, Rang
     //     add_path(rel, seqPath);
     // }
 
+    // foreach(lc, prefilterPaths)
+    // {
+    //     Path *path = (Path *) lfirst(lc);
+    //     path->rows = 10;
+    //     path->startup_cost = 0.1;
+    //     path->total_cost = 1;
+    //     add_path(rel, path);
+    // }
+
     // if (indexPath)
     // {
     //     indexPath->rows = 10;
     //     indexPath->startup_cost = 0.1;
     //     indexPath->total_cost = 1;
     //     add_path(rel, indexPath);
+    // }
+
+    // if (bitmapIndexPath){
+    //     bitmapIndexPath->path.rows = 10;
+    //     bitmapIndexPath->path.startup_cost = 0.1;
+    //     bitmapIndexPath->path.total_cost = 1;
+    //     add_path(rel, (Path*) bitmapIndexPath);
     // }
 
     if (push_down_path)
@@ -810,10 +873,17 @@ TupleTableSlot* ExecIndexWithBitmapScan(CustomScanState *node)
     IndexScanDesc               inputIndexScanDesc = myscanstate->vectorScanDesc;
     if (myscanstate->first){
         /* Search Bitmap Index and get bitmap*/
-        
+        // struct timespec start, end;
+        // double elapsed;
         TIDBitmap* bitmapResult;
         TBMIterator *iterator;
-        myscanstate->bitmapResult = itempointer_create(CurrentMemoryContext, 10000, NULL);
+        // clock_gettime(CLOCK_MONOTONIC, &start);
+        myscanstate->bitmapResult = itempointer_create(CurrentMemoryContext, 1000000, NULL);
+        // clock_gettime(CLOCK_MONOTONIC, &end);
+        // elapsed = (end.tv_sec - start.tv_sec) + 
+            //   (end.tv_nsec - start.tv_nsec) / 1000000000.0;
+        // printf("create bitmapResult time: %.5f seconds\n", elapsed);
+        // clock_gettime(CLOCK_MONOTONIC, &start);
         if (IsA(myscanstate->bitmapScanState, BitmapOrState))
         {
             bitmapResult = (TIDBitmap*) MultiExecBitmapOr((BitmapOrState*)myscanstate->bitmapScanState);
@@ -830,11 +900,14 @@ TupleTableSlot* ExecIndexWithBitmapScan(CustomScanState *node)
         {
             ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Not supported yet: bitmap scan state should be BitmapOrState, BitmapAndState or BitmapIndexScanState")));
         }
+
+        // clock_gettime(CLOCK_MONOTONIC, &end);
+        // elapsed = (end.tv_sec - start.tv_sec) + 
+        //       (end.tv_nsec - start.tv_nsec) / 1000000000.0;
+        // printf("BitmapIndexScan time: %.5f seconds\n", elapsed);
+        // clock_gettime(CLOCK_MONOTONIC, &start);
         iterator = tbm_begin_iterate(bitmapResult);
         
-        // TIDBitmap* bitmapResult = (TIDBitmap*) MultiExecBitmapIndexScan(myscanstate->bitmapScanState);
-        // TBMIterator *iterator = tbm_begin_iterate(bitmapResult);
-        // myscanstate->bitmapResult = itempointer_create(CurrentMemoryContext, 10000, NULL); // TODO: estimate the bitmap result size to create simplehash table
         while (true)
         {
             TBMIterateResult *tbmResult = tbm_iterate(iterator);
@@ -850,7 +923,12 @@ TupleTableSlot* ExecIndexWithBitmapScan(CustomScanState *node)
                 itempointer_insert(myscanstate->bitmapResult, itemPointer, &found);
             }
         }
+        // clock_gettime(CLOCK_MONOTONIC, &end);
+        // elapsed = (end.tv_sec - start.tv_sec) + 
+        //       (end.tv_nsec - start.tv_nsec) / 1000000000.0;
+        // printf("Calculate bitmap time: %.5f seconds\n", elapsed);
 
+        // clock_gettime(CLOCK_MONOTONIC, &start);
         /* Initialize vector search*/
         {
             IndexWithBitmapScan *scan = myscanstate->scan;
@@ -917,6 +995,11 @@ TupleTableSlot* ExecIndexWithBitmapScan(CustomScanState *node)
 
             index_rescan(myscanstate->vectorScanDesc, NULL, 0, scanKeysOrderBy, nkeysOrderBy);
         }
+        // clock_gettime(CLOCK_MONOTONIC, &end);
+        // elapsed = (end.tv_sec - start.tv_sec) + 
+        //       (end.tv_nsec - start.tv_nsec) / 1000000000.0;
+        // printf("vector search time: %.5f seconds\n", elapsed);
+
         myscanstate->first = false;
     }
 
