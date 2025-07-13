@@ -158,7 +158,7 @@ NeedsUpdated(HnswVacuumState * vacuumstate, HnswElement element)
 	/* Check neighbors */
 	for (int i = 0; i < ntup->count; i++)
 	{
-		ItemPointer indextid = &ntup->indextids[i];
+		ItemPointer indextid = &ntup->indextids[i].indextid;
 
 		if (!ItemPointerIsValid(indextid))
 			continue;
@@ -174,7 +174,7 @@ NeedsUpdated(HnswVacuumState * vacuumstate, HnswElement element)
 	/* Also update if layer 0 is not full */
 	/* This could indicate too many candidates being deleted during insert */
 	if (!needsUpdated)
-		needsUpdated = !ItemPointerIsValid(&ntup->indextids[ntup->count - 1]);
+		needsUpdated = !ItemPointerIsValid(&ntup->indextids[ntup->count - 1].indextid);
 
 	UnlockReleaseBuffer(buf);
 
@@ -529,7 +529,11 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 
 			/* Overwrite neighbors */
 			for (int i = 0; i < ntup->count; i++)
-				ItemPointerSetInvalid(&ntup->indextids[i]);
+			{
+				ItemPointerSetInvalid(&ntup->indextids[i].indextid);
+				ItemPointerSetInvalid(&ntup->indextids[i].tabletid);
+			}
+				
 
 			/* Increment version */
 			/* This is used to avoid incorrect reads for iterative scans */

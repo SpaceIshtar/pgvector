@@ -12,6 +12,7 @@
 #include "utils/sampling.h"
 #include "utils/tuplesort.h"
 #include "vector.h"
+#include "hooks.h"
 
 #if PG_VERSION_NUM >= 150000
 #include "common/pg_prng.h"
@@ -334,5 +335,6 @@ IndexScanDesc ivfflatbeginscan(Relation index, int nkeys, int norderbys);
 void		ivfflatrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int norderbys);
 bool		ivfflatgettuple(IndexScanDesc scan, ScanDirection dir);
 void		ivfflatendscan(IndexScanDesc scan);
-
+bool		ivfflatbitmapsearch(itempointer_hash* bitmap, IndexScanDesc scan, ScanDirection direction);
+bool		ivfflatpushdownsearch(IndexScanDesc scan, ScanDirection direction, hook_evaluateTID evaluate, ExprState *qual, ExprContext  *econtext);
 #endif

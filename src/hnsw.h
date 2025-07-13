@@ -62,7 +62,7 @@
 #define HNSW_TUPLE_ALLOC_SIZE BLCKSZ
 
 #define HNSW_ELEMENT_TUPLE_SIZE(size)	MAXALIGN(offsetof(HnswElementTupleData, data) + (size))
-#define HNSW_NEIGHBOR_TUPLE_SIZE(level, m)	MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + ((level) + 2) * (m) * sizeof(ItemPointerData))
+#define HNSW_NEIGHBOR_TUPLE_SIZE(level, m)	MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + ((level) + 2) * (m) * sizeof(HnswNeighborTidData))
 
 #define HNSW_NEIGHBOR_ARRAY_SIZE(lm)	(offsetof(HnswNeighborArray, items) + sizeof(HnswCandidate) * (lm))
 
@@ -340,12 +340,29 @@ typedef struct HnswElementTupleData
 
 typedef HnswElementTupleData * HnswElementTuple;
 
+typedef struct HnswHeapTupleMapData
+{
+	uint8		type;
+	BlockNumber heapBlk;
+	OffsetNumber heapOffset;
+	BlockNumber indexBlk;
+	OffsetNumber indexOffset;
+}			HnswHeapTupleMapData;
+
+typedef HnswHeapTupleMapData * HnswHeapTupleMapTuple;
+
+typedef struct HnswNeighborTidData
+{
+	ItemPointerData tabletid;
+	ItemPointerData indextid;
+} HnswNeighborTidData;
+
 typedef struct HnswNeighborTupleData
 {
 	uint8		type;
 	uint8		version;
 	uint16		count;
-	ItemPointerData indextids[FLEXIBLE_ARRAY_MEMBER];
+	HnswNeighborTidData indextids[FLEXIBLE_ARRAY_MEMBER];
 }			HnswNeighborTupleData;
 
 typedef HnswNeighborTupleData * HnswNeighborTuple;
@@ -360,7 +377,7 @@ typedef union
 typedef union
 {
 	HnswElement element;
-	ItemPointerData indextid;
+	HnswNeighborTidData tid;
 }			HnswUnvisited;
 
 typedef struct HnswScanOpaqueData
@@ -442,7 +459,7 @@ void		HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Rela
 bool		HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo * typeInfo, HnswSupport * support);
 void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element);
 void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support);
-bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc);
+bool		HnswLoadNeighborTids(HnswElement element, HnswNeighborTidData *indextids, Relation index, int m, int lm, int lc);
 void		HnswInitLockTranche(void);
 const		HnswTypeInfo *HnswGetTypeInfo(Relation index);
 PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);

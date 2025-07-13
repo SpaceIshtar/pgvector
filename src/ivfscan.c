@@ -388,6 +388,204 @@ ivfflatgettuple(IndexScanDesc scan, ScanDirection dir)
 	return true;
 }
 
+static void
+GetBitmapScanItems(itempointer_hash* bitmap, IndexScanDesc scan, Datum value)
+{
+	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
+	TupleDesc	tupdesc = RelationGetDescr(scan->indexRelation);
+	TupleTableSlot *slot = so->vslot;
+	int			batchProbes = 0;
+
+	tuplesort_reset(so->sortstate);
+
+	/* Search closest probes lists */
+	while (so->listIndex < so->maxProbes && (++batchProbes) <= so->probes)
+	{
+		BlockNumber searchPage = so->listPages[so->listIndex++];
+
+		/* Search all entry pages for list */
+		while (BlockNumberIsValid(searchPage))
+		{
+			Buffer		buf;
+			Page		page;
+			OffsetNumber maxoffno;
+
+			buf = ReadBufferExtended(scan->indexRelation, MAIN_FORKNUM, searchPage, RBM_NORMAL, so->bas);
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buf);
+			maxoffno = PageGetMaxOffsetNumber(page);
+
+			for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
+			{
+				IndexTuple	itup;
+				Datum		datum;
+				bool		isnull;
+				ItemId		itemid = PageGetItemId(page, offno);
+
+				itup = (IndexTuple) PageGetItem(page, itemid);
+				if (!itempointer_lookup(bitmap, itup->t_tid))
+				{
+					continue;
+				}
+				datum = index_getattr(itup, 1, tupdesc, &isnull);
+
+				/*
+				 * Add virtual tuple
+				 *
+				 * Use procinfo from the index instead of scan key for
+				 * performance
+				 */
+				ExecClearTuple(slot);
+				slot->tts_values[0] = so->distfunc(so->procinfo, so->collation, datum, value);
+				slot->tts_isnull[0] = false;
+				slot->tts_values[1] = PointerGetDatum(&itup->t_tid);
+				slot->tts_isnull[1] = false;
+				ExecStoreVirtualTuple(slot);
+
+				tuplesort_puttupleslot(so->sortstate, slot);
+			}
+
+			searchPage = IvfflatPageGetOpaque(page)->nextblkno;
+
+			UnlockReleaseBuffer(buf);
+		}
+	}
+
+	tuplesort_performsort(so->sortstate);
+
+#if defined(IVFFLAT_MEMORY)
+	elog(INFO, "memory: %zu MB", MemoryContextMemAllocated(CurrentMemoryContext, true) / (1024 * 1024));
+#endif
+}
+
+bool
+ivfflatbitmapsearch(itempointer_hash* bitmap, IndexScanDesc scan, ScanDirection direction)
+{
+	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
+	ItemPointer heaptid;
+	bool		isnull;
+
+	/*
+	 * Index can be used to scan backward, but Postgres doesn't support
+	 * backward scan on operators
+	 */
+	Assert(ScanDirectionIsForward(dir));
+
+	if (so->first)
+	{
+		Datum		value;
+
+		/* Count index scan for stats */
+		pgstat_count_index_scan(scan->indexRelation);
+
+		/* Safety check */
+		if (scan->orderByData == NULL)
+			elog(ERROR, "cannot scan ivfflat index without order");
+
+		/* Requires MVCC-compliant snapshot as not able to pin during sorting */
+		/* https://www.postgresql.org/docs/current/index-locking.html */
+		if (!IsMVCCSnapshot(scan->xs_snapshot))
+			elog(ERROR, "non-MVCC snapshots are not supported with ivfflat");
+
+		value = GetScanValue(scan);
+		IvfflatBench("GetScanLists", GetScanLists(scan, value));
+		IvfflatBench("GetBitmapScanItems", GetBitmapScanItems(bitmap, scan, value));
+		so->first = false;
+		so->value = value;
+	}
+
+	while (!tuplesort_gettupleslot(so->sortstate, true, false, so->mslot, NULL))
+	{
+		if (so->listIndex == so->maxProbes)
+			return false;
+
+		IvfflatBench("GetBitmapScanItems", GetBitmapScanItems(bitmap, scan, so->value));
+	}
+
+	heaptid = (ItemPointer) DatumGetPointer(slot_getattr(so->mslot, 2, &isnull));
+
+	scan->xs_heaptid = *heaptid;
+	scan->xs_recheck = false;
+	scan->xs_recheckorderby = false;
+	return true;
+}
+
+static void
+GetPushDownScanItems(itempointer_hash* bitmap, IndexScanDesc scan, Datum value, hook_evaluateTID evaluate_func, ExprState *qual, ExprContext *econtext)
+{
+	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
+	TupleDesc	tupdesc = RelationGetDescr(scan->indexRelation);
+	TupleTableSlot *slot = so->vslot;
+	int			batchProbes = 0;
+
+	tuplesort_reset(so->sortstate);
+
+	/* Search closest probes lists */
+	while (so->listIndex < so->maxProbes && (++batchProbes) <= so->probes)
+	{
+		BlockNumber searchPage = so->listPages[so->listIndex++];
+
+		/* Search all entry pages for list */
+		while (BlockNumberIsValid(searchPage))
+		{
+			Buffer		buf;
+			Page		page;
+			OffsetNumber maxoffno;
+
+			buf = ReadBufferExtended(scan->indexRelation, MAIN_FORKNUM, searchPage, RBM_NORMAL, so->bas);
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buf);
+			maxoffno = PageGetMaxOffsetNumber(page);
+
+			for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
+			{
+				IndexTuple	itup;
+				Datum		datum;
+				bool		isnull;
+				ItemId		itemid = PageGetItemId(page, offno);
+
+				itup = (IndexTuple) PageGetItem(page, itemid);
+				if (!itempointer_lookup(bitmap, itup->t_tid))
+				{
+					continue;
+				}
+				datum = index_getattr(itup, 1, tupdesc, &isnull);
+
+				/*
+				 * Add virtual tuple
+				 *
+				 * Use procinfo from the index instead of scan key for
+				 * performance
+				 */
+				ExecClearTuple(slot);
+				slot->tts_values[0] = so->distfunc(so->procinfo, so->collation, datum, value);
+				slot->tts_isnull[0] = false;
+				slot->tts_values[1] = PointerGetDatum(&itup->t_tid);
+				slot->tts_isnull[1] = false;
+				ExecStoreVirtualTuple(slot);
+
+				tuplesort_puttupleslot(so->sortstate, slot);
+			}
+
+			searchPage = IvfflatPageGetOpaque(page)->nextblkno;
+
+			UnlockReleaseBuffer(buf);
+		}
+	}
+
+	tuplesort_performsort(so->sortstate);
+
+#if defined(IVFFLAT_MEMORY)
+	elog(INFO, "memory: %zu MB", MemoryContextMemAllocated(CurrentMemoryContext, true) / (1024 * 1024));
+#endif
+}
+
+bool
+ivfflatpushdownsearch(IndexScanDesc scan, ScanDirection direction, hook_evaluateTID evaluate, ExprState *qual, ExprContext  *econtext)
+{
+	return false;
+}
+
 /*
  * End a scan and release resources
  */

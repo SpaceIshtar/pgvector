@@ -3,6 +3,7 @@
 
 #include "hooks.h"
 #include "hnsw.h"
+#include "ivfflat.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "catalog/pg_am.h"
@@ -40,7 +41,7 @@ hook_murmurhash64(uint64 data)
 }
 #endif
 
-static uint32
+static inline uint32
 hash_itempointer(ItemPointerData tid)
 {
 	union
@@ -66,7 +67,8 @@ hash_itempointer(ItemPointerData tid)
 #define SH_DEFINE
 #include "lib/simplehash.h"
 
-static IndexHookInfo hnsw_hook_info = {InvalidOid, NULL};
+static IndexHookInfo hnsw_hook_info = {InvalidOid, NULL, NULL};
+static IndexHookInfo ivf_hook_info = {InvalidOid, NULL, NULL};
 static Oid  vector_oid = InvalidOid;
 static Oid  range_query_params_oid = InvalidOid;
 static Oid  l2_distance_oid = InvalidOid;
@@ -98,10 +100,20 @@ static void set_hook_info()
         hnsw_hook_info.index_oid = get_access_method_oid_by_name("hnsw");
         if (!OidIsValid(hnsw_hook_info.index_oid))
         {
-            ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Cannot find the oid of index_oid")));
+            ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Cannot find the oid of hnsw")));
         }
         hnsw_hook_info.bitmapsearch_func = hnswbitmapsearch;
         hnsw_hook_info.pushdownsearch_func = hnswpushdownsearch;
+    }
+    if (!OidIsValid(ivf_hook_info.index_oid))
+    {
+        ivf_hook_info.index_oid = get_access_method_oid_by_name("ivfflat");
+        if (!OidIsValid(ivf_hook_info.index_oid))
+        {
+            ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Cannot find the oid of ivf")));
+        }
+        ivf_hook_info.bitmapsearch_func = ivfflatbitmapsearch;
+        ivf_hook_info.pushdownsearch_func = ivfflatpushdownsearch;
     }
 }
 
@@ -110,6 +122,10 @@ static IndexHookInfo* getIndexHookInfo(Oid relam)
     if (hnsw_hook_info.index_oid == relam)
     {
         return &hnsw_hook_info;
+    }
+    else if (ivf_hook_info.index_oid == relam)
+    {
+        return &ivf_hook_info;
     }
     else{
         ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("The IndexOptInfo is not our index")));
@@ -479,6 +495,7 @@ static CustomPath* create_bitmapIndexPath(PlannerInfo *root, RelOptInfo *rel, Li
     orderByPath->parallel_aware = false;
     orderByPath->parallel_safe = rel->consider_parallel;
     orderByPath->parallel_workers = 0;
+    orderByPath->bitmap_rows = bitmappath->rows;
 
     orderByPath->indexinfo = index;
     orderByPath->orderByClauses = vectorOrderByClauses;
@@ -621,6 +638,7 @@ static List* generate_prefilter_paths(PlannerInfo *root, RelOptInfo *rel)
 /* Core Function to generate a CustomPath*/
 void set_custom_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte)
 {   
+    return;
     bool    hasOrderByVector, hasWhereVector;
     ListCell    *lc;
     Path    *seqPath = NULL, *indexPath = NULL, *push_down_path = NULL;
@@ -804,6 +822,7 @@ Plan*   generateBitmapIndexScan(PlannerInfo *root, RelOptInfo *rel, CustomPath *
     indexbitmapscan->indexhookinfo = getIndexHookInfo(indexbitmappath->indexinfo->relam);
     /* TODO: fix orderByClauses, need to correct varno and varattno of leftop*/
     indexbitmapscan->orderByClauses = fix_orderby_clauses(root, rel, indexbitmappath, indexbitmappath->orderByClauses);
+    indexbitmapscan->bitmap_rows = indexbitmappath->bitmap_rows;
     
     result->custom_private = lappend(result->custom_private, indexbitmapscan);
     
@@ -868,9 +887,11 @@ void BeginIndexWithBitmapScan(CustomScanState *node, EState *estate, int eflags)
 TupleTableSlot* ExecIndexWithBitmapScan(CustomScanState *node)
 {
     IndexWithBitmapScanState    *myscanstate = (IndexWithBitmapScanState*)node;
+    IndexWithBitmapScan         *myscan = (IndexWithBitmapScan*)myscanstate->customScanState.ss.ps.plan;
     ambitmapsearch              vectorSearchMethod = myscanstate->scan->indexhookinfo->bitmapsearch_func;
     TupleTableSlot              *slot = myscanstate->slot;
     IndexScanDesc               inputIndexScanDesc = myscanstate->vectorScanDesc;
+    double                      hash_table_size = myscan->bitmap_rows * 1.2;
     if (myscanstate->first){
         /* Search Bitmap Index and get bitmap*/
         // struct timespec start, end;
@@ -878,7 +899,7 @@ TupleTableSlot* ExecIndexWithBitmapScan(CustomScanState *node)
         TIDBitmap* bitmapResult;
         TBMIterator *iterator;
         // clock_gettime(CLOCK_MONOTONIC, &start);
-        myscanstate->bitmapResult = itempointer_create(CurrentMemoryContext, 1000000, NULL);
+        myscanstate->bitmapResult = itempointer_create(CurrentMemoryContext, hash_table_size, NULL);
         // clock_gettime(CLOCK_MONOTONIC, &end);
         // elapsed = (end.tv_sec - start.tv_sec) + 
             //   (end.tv_nsec - start.tv_nsec) / 1000000000.0;
@@ -998,7 +1019,7 @@ TupleTableSlot* ExecIndexWithBitmapScan(CustomScanState *node)
         // clock_gettime(CLOCK_MONOTONIC, &end);
         // elapsed = (end.tv_sec - start.tv_sec) + 
         //       (end.tv_nsec - start.tv_nsec) / 1000000000.0;
-        // printf("vector search time: %.5f seconds\n", elapsed);
+        // printf("init vector search time: %.5f seconds\n", elapsed);
 
         myscanstate->first = false;
     }
@@ -1312,12 +1333,14 @@ static void set_oids(void)
 }
 
 void register_hook(void){
+    return;
     next_set_pathlist_hook = set_rel_pathlist_hook;
     set_rel_pathlist_hook = set_custom_rel_pathlist;
     set_oids();
 }
 
 void unregister_hook(void){
+    return;
     set_rel_pathlist_hook = next_set_pathlist_hook;
     next_set_pathlist_hook = NULL;
 }

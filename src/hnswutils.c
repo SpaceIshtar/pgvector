@@ -461,17 +461,33 @@ HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m)
 
 		for (int i = 0; i < lm; i++)
 		{
-			ItemPointer indextid = &ntup->indextids[idx++];
+			// ItemPointer indextid = &ntup->indextids[idx++];
 
+			// if (i < neighbors->length)
+			// {
+			// 	HnswCandidate *hc = &neighbors->items[i];
+			// 	HnswElement hce = HnswPtrAccess(base, hc->element);
+
+			// 	ItemPointerSet(indextid, hce->blkno, hce->offno);
+			// }
+			// else
+			// 	ItemPointerSetInvalid(indextid);
 			if (i < neighbors->length)
 			{
 				HnswCandidate *hc = &neighbors->items[i];
 				HnswElement hce = HnswPtrAccess(base, hc->element);
-
-				ItemPointerSet(indextid, hce->blkno, hce->offno);
+				ntup->indextids[idx].tabletid = hce->heaptids[0];
+				ItemPointerSet(&ntup->indextids[idx].indextid, hce->blkno, hce->offno);
+				if (ntup->indextids[idx].indextid.ip_blkid.bi_hi > 100)
+				{
+					elog(ERROR, "blk_hi too large");
+				}
+				idx++;
 			}
-			else
-				ItemPointerSetInvalid(indextid);
+			else{
+				ItemPointerSetInvalid(&ntup->indextids[idx].tabletid);
+				ItemPointerSetInvalid(&ntup->indextids[idx++].indextid);	
+			}
 		}
 	}
 
@@ -749,7 +765,7 @@ HnswLoadUnvisitedFromMemory(char *base, HnswElement element, HnswUnvisited * unv
  * Load neighbor index TIDs
  */
 bool
-HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc)
+HnswLoadNeighborTids(HnswElement element, HnswNeighborTidData *indextids, Relation index, int m, int lm, int lc)
 {
 	Buffer		buf;
 	Page		page;
@@ -774,7 +790,8 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
 
 	/* Copy to minimize lock time */
 	start = (element->level - lc) * m;
-	memcpy(indextids, ntup->indextids + start, lm * sizeof(ItemPointerData));
+	// memcpy(indextids, ntup->indextids + start, lm * sizeof(ItemPointerData));
+	memcpy(indextids, ntup->indextids + start, lm * sizeof(HnswNeighborTidData));
 
 	UnlockReleaseBuffer(buf);
 	return true;
@@ -786,7 +803,7 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
 static void
 HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc)
 {
-	ItemPointerData indextids[HNSW_MAX_M * 2];
+	HnswNeighborTidData indextids[HNSW_MAX_M * 2];
 
 	*unvisitedLength = 0;
 
@@ -795,7 +812,7 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 
 	for (int i = 0; i < lm; i++)
 	{
-		ItemPointer indextid = &indextids[i];
+		ItemPointer indextid = &indextids[i].indextid;
 		bool		found;
 
 		if (!ItemPointerIsValid(indextid))
@@ -804,7 +821,11 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 		tidhash_insert(v->tids, *indextid, &found);
 
 		if (!found)
-			unvisited[(*unvisitedLength)++].indextid = *indextid;
+		{
+			// unvisited[(*unvisitedLength)].tabletid = *tabletid;
+			// unvisited[(*unvisitedLength)++].indextid = *indextid;
+			unvisited[(*unvisitedLength)++].tid = indextids[i];
+		}
 	}
 }
 
@@ -911,7 +932,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			}
 			else
 			{
-				ItemPointer indextid = &unvisited[i].indextid;
+				ItemPointer indextid = &unvisited[i].tid.indextid;
 				BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
 				OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
 
@@ -986,6 +1007,7 @@ HnswSearchLayerWithBitmap(char *base, HnswQuery * q, List *ep, int ef, int lc, R
 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
 	pairingheap *W = pairingheap_allocate(CompareFurthestCandidates, NULL);
 	int			wlen = 0;
+	float		alpha = 0.05;
 	visited_hash vh;
 	ListCell   *lc2;
 	HnswNeighborArray *localNeighborhood = NULL;
@@ -1044,9 +1066,6 @@ HnswSearchLayerWithBitmap(char *base, HnswQuery * q, List *ep, int ef, int lc, R
 			if (CountElement(skipElement, HnswPtrAccess(base, sc->element)))
 				wlen++;
 		}
-		
-
-		
 	}
 
 	while (!pairingheap_is_empty(C))
@@ -1080,7 +1099,13 @@ HnswSearchLayerWithBitmap(char *base, HnswQuery * q, List *ep, int ef, int lc, R
 			HnswSearchCandidate *e;
 			double		eDistance;
 			bool		alwaysAdd = wlen < ef;
+			double      random_num = RandomDouble();
+			bool        satisfy = itempointer_lookup(bitmap, unvisited[i].tid.tabletid);
 
+			if ((!satisfy) && random_num > alpha)
+			{
+				continue;
+			}
 
 			if (!pairingheap_is_empty(W))
 			{
@@ -1094,7 +1119,7 @@ HnswSearchLayerWithBitmap(char *base, HnswQuery * q, List *ep, int ef, int lc, R
 			}
 			else
 			{
-				ItemPointer indextid = &unvisited[i].indextid;
+				ItemPointer indextid = &unvisited[i].tid.indextid;
 				BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
 				OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
 
@@ -1106,10 +1131,6 @@ HnswSearchLayerWithBitmap(char *base, HnswQuery * q, List *ep, int ef, int lc, R
 					continue;
 			}
 
-			if (!itempointer_lookup(bitmap, eElement->heaptids[0]))
-			{
-				continue;
-			}
 
 			if (!inMemory)
 			{
@@ -1136,6 +1157,10 @@ HnswSearchLayerWithBitmap(char *base, HnswQuery * q, List *ep, int ef, int lc, R
 			e = HnswInitSearchCandidate(base, eElement, eDistance);
 			pairingheap_add(C, &e->c_node);
 
+			if (!satisfy)
+			{
+				continue;
+			}
 			/*
 			 * Do not count elements being deleted towards ef when vacuuming.
 			 * It would be ideal to do this for inserts as well, but this
@@ -1179,6 +1204,7 @@ HnswPushDownSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Rel
 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
 	pairingheap *W = pairingheap_allocate(CompareFurthestCandidates, NULL);
 	int			wlen = 0;
+	float		alpha = 0.05;
 	visited_hash vh;
 	ListCell   *lc2;
 	HnswNeighborArray *localNeighborhood = NULL;
@@ -1286,13 +1312,13 @@ HnswPushDownSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Rel
 		length = 0;
 		for (int i = 0; i < unvisitedLength; i++)
 		{
-			HnswElement eElement = NULL;
-			ItemPointer indextid = &unvisited[i].indextid;
-			BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
-			OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
-			HnswLoadElementImpl(blkno, offno, NULL, q, index, support, true, NULL, &eElement);
-			unvisited[i].element = eElement;
-			reserved_itempointer_list[length] = &eElement->heaptids[0];
+			// HnswElement eElement = NULL;
+			// ItemPointer indextid = &unvisited[i].indextid;
+			// BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
+			// OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
+			// HnswLoadElementImpl(blkno, offno, NULL, q, index, support, true, NULL, &eElement);
+			// unvisited[i].element = eElement;
+			reserved_itempointer_list[length] = &unvisited[i].tid.tabletid;
 			reserved_result_list[length] = false;
 			length++;
 		}
@@ -1300,12 +1326,14 @@ HnswPushDownSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Rel
 
 		for (int i = 0; i < unvisitedLength; i++)
 		{
-			HnswElement eElement;
+			HnswElement eElement = NULL;
 			HnswSearchCandidate *e;
 			double		eDistance;
+			ItemPointer indextid;
 			bool		alwaysAdd = wlen < ef;
+			double		random_num = RandomDouble();
 
-			if (!reserved_result_list[i])
+			if ((!reserved_result_list[i]) && random_num > alpha)
 			{
 				continue;
 			}
@@ -1317,8 +1345,10 @@ HnswPushDownSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Rel
 			}
 
 			
-			eElement = unvisited[i].element;
-			eDistance = GetElementDistance(base, eElement, q, support);
+			// eElement = unvisited[i].element;
+			indextid = &unvisited[i].tid.indextid;
+			HnswLoadElementImpl(ItemPointerGetBlockNumber(indextid), ItemPointerGetOffsetNumber(indextid), &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
+			// eDistance = GetElementDistance(base, eElement, q, support);
 			
 
 			if (eElement == NULL || !((f && eDistance < f->distance) || alwaysAdd))
@@ -1341,6 +1371,10 @@ HnswPushDownSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Rel
 			e = HnswInitSearchCandidate(base, eElement, eDistance);
 			pairingheap_add(C, &e->c_node);
 
+			if (!reserved_result_list[i])
+			{
+				continue;
+			}
 			/*
 			 * Do not count elements being deleted towards ef when vacuuming.
 			 * It would be ideal to do this for inserts as well, but this

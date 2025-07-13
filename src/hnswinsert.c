@@ -348,14 +348,15 @@ HnswLoadNeighbors(HnswElement element, Relation index, int m, int lm, int lc)
 {
 	char	   *base = NULL;
 	HnswNeighborArray *neighbors = HnswInitNeighborArray(lm, NULL);
-	ItemPointerData indextids[HNSW_MAX_M * 2];
+	// ItemPointerData indextids[HNSW_MAX_M * 2];
+	HnswNeighborTidData indextids[HNSW_MAX_M * 2];
 
 	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
 		return neighbors;
 
 	for (int i = 0; i < lm; i++)
 	{
-		ItemPointer indextid = &indextids[i];
+		ItemPointer indextid = &indextids[i].indextid;
 		HnswElement e;
 		HnswCandidate *hc;
 
@@ -449,7 +450,7 @@ ConnectionExists(HnswElement e, HnswNeighborTuple ntup, int startIdx, int lm)
 {
 	for (int i = 0; i < lm; i++)
 	{
-		ItemPointer indextid = &ntup->indextids[startIdx + i];
+		ItemPointer indextid = &ntup->indextids[startIdx + i].indextid;
 
 		if (!ItemPointerIsValid(indextid))
 			break;
@@ -503,7 +504,7 @@ UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m
 		/* TODO Retry updating connections if not */
 		for (int j = 0; j < lm; j++)
 		{
-			if (!ItemPointerIsValid(&ntup->indextids[startIdx + j]))
+			if (!ItemPointerIsValid(&ntup->indextids[startIdx + j].indextid))
 			{
 				idx = startIdx + j;
 				break;
@@ -516,10 +517,15 @@ UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m
 	/* Make robust to issues */
 	if (idx >= 0 && idx < ntup->count)
 	{
-		ItemPointer indextid = &ntup->indextids[idx];
+		ItemPointer indextid = &ntup->indextids[idx].indextid;
 
 		/* Update neighbor on the buffer */
 		ItemPointerSet(indextid, newElement->blkno, newElement->offno);
+		if (indextid->ip_blkid.bi_hi > 100)
+		{
+			elog(ERROR, "blk_hi too large");
+		}
+		ntup->indextids[idx].tabletid = newElement->heaptids[0];
 
 		/* Commit */
 		if (building)

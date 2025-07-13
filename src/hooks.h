@@ -67,6 +67,7 @@ typedef struct IndexWithBitmapPath{
 
     IndexOptInfo *indexinfo;
     List    *orderByClauses; /* Must be vector clause and length = 1*/
+    Cardinality  bitmap_rows;
 } IndexWithBitmapPath;
 
 typedef struct IndexWithBitmapScan{
@@ -74,6 +75,7 @@ typedef struct IndexWithBitmapScan{
     IndexHookInfo       *indexhookinfo;
     IndexOptInfo        *indexinfo;
     List                *orderByClauses;
+    Cardinality        bitmap_rows;
 } IndexWithBitmapScan;
 
 typedef struct IndexWithBitmapScanState{
