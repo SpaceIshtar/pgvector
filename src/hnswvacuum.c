@@ -158,7 +158,7 @@ NeedsUpdated(HnswVacuumState * vacuumstate, HnswElement element)
 	/* Check neighbors */
 	for (int i = 0; i < ntup->count; i++)
 	{
-		ItemPointer indextid = &ntup->indextids[i].indextid;
+		ItemPointer indextid = &ntup->indextids[i];
 
 		if (!ItemPointerIsValid(indextid))
 			continue;
@@ -174,7 +174,7 @@ NeedsUpdated(HnswVacuumState * vacuumstate, HnswElement element)
 	/* Also update if layer 0 is not full */
 	/* This could indicate too many candidates being deleted during insert */
 	if (!needsUpdated)
-		needsUpdated = !ItemPointerIsValid(&ntup->indextids[ntup->count - 1].indextid);
+		needsUpdated = !ItemPointerIsValid(&ntup->indextids[ntup->count - 1]);
 
 	UnlockReleaseBuffer(buf);
 
@@ -289,7 +289,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
 			 * point is outdated and empty, the entry point will be empty
 			 * until an element is repaired.
 			 */
-			HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, highestPoint, InvalidBlockNumber, MAIN_FORKNUM, false);
+			HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, highestPoint, InvalidBlockNumber, InvalidBlockNumber, MAIN_FORKNUM, false);
 		}
 		else
 		{
@@ -422,7 +422,7 @@ RepairGraph(HnswVacuumState * vacuumstate)
 			 * was replaced and highest point was outdated.
 			 */
 			if (entryPoint == NULL || element->level > entryPoint->level)
-				HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_GREATER, element, InvalidBlockNumber, MAIN_FORKNUM, false);
+				HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_GREATER, element, InvalidBlockNumber, InvalidBlockNumber, MAIN_FORKNUM, false);
 
 			/* Release lock */
 			UnlockPage(index, HNSW_UPDATE_LOCK, lockmode);
@@ -530,8 +530,7 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 			/* Overwrite neighbors */
 			for (int i = 0; i < ntup->count; i++)
 			{
-				ItemPointerSetInvalid(&ntup->indextids[i].indextid);
-				ItemPointerSetInvalid(&ntup->indextids[i].tabletid);
+				ItemPointerSetInvalid(&ntup->indextids[i]);
 			}
 				
 
@@ -569,7 +568,7 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 	}
 
 	/* Update insert page last, after everything has been marked as deleted */
-	HnswUpdateMetaPage(index, 0, NULL, insertPage, MAIN_FORKNUM, false);
+	HnswUpdateMetaPage(index, 0, NULL, insertPage, InvalidBlockNumber, MAIN_FORKNUM, false);
 }
 
 /*
@@ -597,7 +596,7 @@ InitVacuumState(HnswVacuumState * vacuumstate, IndexVacuumInfo *info, IndexBulkD
 	HnswInitSupport(&vacuumstate->support, index);
 
 	/* Get m from metapage */
-	HnswGetMetaPageInfo(index, &vacuumstate->m, NULL);
+	HnswGetMetaPageInfo(index, &vacuumstate->m, NULL, NULL);
 
 	/* Create hash table */
 	vacuumstate->deleted = tidhash_create(CurrentMemoryContext, 256, NULL);

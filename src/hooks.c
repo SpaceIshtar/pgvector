@@ -638,7 +638,6 @@ static List* generate_prefilter_paths(PlannerInfo *root, RelOptInfo *rel)
 /* Core Function to generate a CustomPath*/
 void set_custom_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte)
 {   
-    return;
     bool    hasOrderByVector, hasWhereVector;
     ListCell    *lc;
     Path    *seqPath = NULL, *indexPath = NULL, *push_down_path = NULL;
@@ -717,20 +716,20 @@ void set_custom_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, Rang
     //     add_path(rel, indexPath);
     // }
 
-    // if (bitmapIndexPath){
-    //     bitmapIndexPath->path.rows = 10;
-    //     bitmapIndexPath->path.startup_cost = 0.1;
-    //     bitmapIndexPath->path.total_cost = 1;
-    //     add_path(rel, (Path*) bitmapIndexPath);
-    // }
-
-    if (push_down_path)
-    {
-        push_down_path->rows = 10;
-        push_down_path->startup_cost = 0.1;
-        push_down_path->total_cost = 1;
-        add_path(rel, push_down_path);
+    if (bitmapIndexPath){
+        bitmapIndexPath->path.rows = 10;
+        bitmapIndexPath->path.startup_cost = 0.1;
+        bitmapIndexPath->path.total_cost = 1;
+        add_path(rel, (Path*) bitmapIndexPath);
     }
+
+    // if (push_down_path)
+    // {
+    //     push_down_path->rows = 10;
+    //     push_down_path->startup_cost = 0.1;
+    //     push_down_path->total_cost = 1;
+    //     add_path(rel, push_down_path);
+    // }
 }
 
 /* Functions for Bitmap+IndexScan*/
@@ -1333,14 +1332,14 @@ static void set_oids(void)
 }
 
 void register_hook(void){
-    return;
+    // return;
     next_set_pathlist_hook = set_rel_pathlist_hook;
     set_rel_pathlist_hook = set_custom_rel_pathlist;
     set_oids();
 }
 
 void unregister_hook(void){
-    return;
+    // return;
     set_rel_pathlist_hook = next_set_pathlist_hook;
     next_set_pathlist_hook = NULL;
 }

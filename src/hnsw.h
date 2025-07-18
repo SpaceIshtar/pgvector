@@ -12,6 +12,7 @@
 #include "utils/sampling.h"
 #include "vector.h"
 #include "hooks.h"
+#include "ItemPointerBtree.h"
 
 #define HNSW_MAX_DIM 2000
 #define HNSW_MAX_NNZ 1000
@@ -62,7 +63,7 @@
 #define HNSW_TUPLE_ALLOC_SIZE BLCKSZ
 
 #define HNSW_ELEMENT_TUPLE_SIZE(size)	MAXALIGN(offsetof(HnswElementTupleData, data) + (size))
-#define HNSW_NEIGHBOR_TUPLE_SIZE(level, m)	MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + ((level) + 2) * (m) * sizeof(HnswNeighborTidData))
+#define HNSW_NEIGHBOR_TUPLE_SIZE(level, m)	MAXALIGN(offsetof(HnswNeighborTupleData, indextids) + ((level) + 2) * (m) * sizeof(ItemPointerData))
 
 #define HNSW_NEIGHBOR_ARRAY_SIZE(lm)	(offsetof(HnswNeighborArray, items) + sizeof(HnswCandidate) * (lm))
 
@@ -313,6 +314,7 @@ typedef struct HnswMetaPageData
 	OffsetNumber entryOffno;
 	int16		entryLevel;
 	BlockNumber insertPage;
+	BlockNumber IPTrootPage;
 }			HnswMetaPageData;
 
 typedef HnswMetaPageData * HnswMetaPage;
@@ -340,29 +342,12 @@ typedef struct HnswElementTupleData
 
 typedef HnswElementTupleData * HnswElementTuple;
 
-typedef struct HnswHeapTupleMapData
-{
-	uint8		type;
-	BlockNumber heapBlk;
-	OffsetNumber heapOffset;
-	BlockNumber indexBlk;
-	OffsetNumber indexOffset;
-}			HnswHeapTupleMapData;
-
-typedef HnswHeapTupleMapData * HnswHeapTupleMapTuple;
-
-typedef struct HnswNeighborTidData
-{
-	ItemPointerData tabletid;
-	ItemPointerData indextid;
-} HnswNeighborTidData;
-
 typedef struct HnswNeighborTupleData
 {
 	uint8		type;
 	uint8		version;
 	uint16		count;
-	HnswNeighborTidData indextids[FLEXIBLE_ARRAY_MEMBER];
+	ItemPointerData indextids[FLEXIBLE_ARRAY_MEMBER];
 }			HnswNeighborTupleData;
 
 typedef HnswNeighborTupleData * HnswNeighborTuple;
@@ -377,7 +362,7 @@ typedef union
 typedef union
 {
 	HnswElement element;
-	HnswNeighborTidData tid;
+	ItemPointerData tid;
 }			HnswUnvisited;
 
 typedef struct HnswScanOpaqueData
@@ -438,16 +423,16 @@ Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
 void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
 List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
-List	   *HnswSearchLayerWithBitmap(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, itempointer_hash *bitmap, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
-List	   *HnswPushDownSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, hook_evaluateTID evaluate_func, ExprState *qual, ExprContext *econtext, IndexScanDesc scan);
+List	   *HnswSearchLayerWithBitmap(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, itempointer_hash *bitmap, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, BlockNumber IPTRootPage);
+List	   *HnswPushDownSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, hook_evaluateTID evaluate_func, ExprState *qual, ExprContext *econtext, IndexScanDesc scan, BlockNumber IPTRootPage);
 HnswElement HnswGetEntryPoint(Relation index);
-void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
+void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint, BlockNumber* IPTRootPage);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
 HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc);
 HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);
 void		HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing);
 HnswSearchCandidate *HnswEntryCandidate(char *base, HnswElement em, HnswQuery * q, Relation rel, HnswSupport * support, bool loadVec);
-void		HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building);
+void		HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, BlockNumber IPTRootPage, ForkNumber forkNum, bool building);
 void		HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m);
 void		HnswAddHeapTid(HnswElement element, ItemPointer heaptid);
 HnswNeighborArray *HnswInitNeighborArray(int lm, HnswAllocator * allocator);
@@ -459,7 +444,7 @@ void		HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Rela
 bool		HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo * typeInfo, HnswSupport * support);
 void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element);
 void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support);
-bool		HnswLoadNeighborTids(HnswElement element, HnswNeighborTidData *indextids, Relation index, int m, int lm, int lc);
+bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc);
 void		HnswInitLockTranche(void);
 const		HnswTypeInfo *HnswGetTypeInfo(Relation index);
 PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);

@@ -27,7 +27,7 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	HnswQuery  *q = &so->q;
 
 	/* Get m and entry point */
-	HnswGetMetaPageInfo(index, &m, &entryPoint);
+	HnswGetMetaPageInfo(index, &m, &entryPoint, NULL);
 
 	q->value = value;
 	so->m = m;
@@ -370,9 +370,10 @@ GetBitmapScanItems(itempointer_hash* bitmap, IndexScanDesc scan, Datum value)
 	HnswElement entryPoint;
 	char	   *base = NULL;
 	HnswQuery  *q = &so->q;
+	BlockNumber IPTRootPage = InvalidBlockNumber;
 
 	/* Get m and entry point */
-	HnswGetMetaPageInfo(index, &m, &entryPoint);
+	HnswGetMetaPageInfo(index, &m, &entryPoint, &IPTRootPage);
 
 	q->value = value;
 	so->m = m;
@@ -388,7 +389,7 @@ GetBitmapScanItems(itempointer_hash* bitmap, IndexScanDesc scan, Datum value)
 		ep = w;
 	}
 
-	return HnswSearchLayerWithBitmap(base, q, ep, hnsw_ef_search, 0, index, support, m, bitmap, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples);
+	return HnswSearchLayerWithBitmap(base, q, ep, hnsw_ef_search, 0, index, support, m, bitmap, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, IPTRootPage);
 }
 
 static List *
@@ -399,6 +400,9 @@ ResumeBitmapScanItems(itempointer_hash* bitmap, IndexScanDesc scan)
 	List	   *ep = NIL;
 	char	   *base = NULL;
 	int			batch_size = hnsw_ef_search;
+	BlockNumber IPTRootPage = InvalidBlockNumber;
+
+	HnswGetMetaPageInfo(index, NULL, NULL, &IPTRootPage);
 
 	if (pairingheap_is_empty(so->discarded))
 		return NIL;
@@ -416,7 +420,7 @@ ResumeBitmapScanItems(itempointer_hash* bitmap, IndexScanDesc scan)
 		ep = lappend(ep, sc);
 	}
 
-	return HnswSearchLayerWithBitmap(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, bitmap, false, NULL, &so->v, &so->discarded, false, &so->tuples);
+	return HnswSearchLayerWithBitmap(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, bitmap, false, NULL, &so->v, &so->discarded, false, &so->tuples, IPTRootPage);
 }
 
 bool hnswbitmapsearch(itempointer_hash* bitmap, IndexScanDesc scan, ScanDirection direction)
@@ -577,9 +581,10 @@ static List *GetPushDownScanItems(IndexScanDesc scan, Datum value, hook_evaluate
 	HnswElement entryPoint;
 	char	   *base = NULL;
 	HnswQuery  *q = &so->q;
+	BlockNumber IPTRootPage = InvalidBlockNumber;
 
 	/* Get m and entry point */
-	HnswGetMetaPageInfo(index, &m, &entryPoint);
+	HnswGetMetaPageInfo(index, &m, &entryPoint, &IPTRootPage);
 
 	q->value = value;
 	so->m = m;
@@ -595,7 +600,7 @@ static List *GetPushDownScanItems(IndexScanDesc scan, Datum value, hook_evaluate
 		ep = w;
 	}
 
-	return HnswPushDownSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, evaluate_func, qual, econtext, scan);
+	return HnswPushDownSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, evaluate_func, qual, econtext, scan, IPTRootPage);
 }
 
 static List *ResumePushDownScanItems(IndexScanDesc scan, hook_evaluateTID evaluate_func, ExprState *qual, ExprContext *econtext)
@@ -605,6 +610,9 @@ static List *ResumePushDownScanItems(IndexScanDesc scan, hook_evaluateTID evalua
 	List	   *ep = NIL;
 	char	   *base = NULL;
 	int			batch_size = hnsw_ef_search;
+	BlockNumber IPTRootPage = InvalidBlockNumber;
+
+	HnswGetMetaPageInfo(index, NULL, NULL, &IPTRootPage);
 
 	if (pairingheap_is_empty(so->discarded))
 		return NIL;
@@ -622,7 +630,7 @@ static List *ResumePushDownScanItems(IndexScanDesc scan, hook_evaluateTID evalua
 		ep = lappend(ep, sc);
 	}
 
-	return HnswPushDownSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples, evaluate_func, qual, econtext, scan);
+	return HnswPushDownSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples, evaluate_func, qual, econtext, scan, IPTRootPage);
 }
 
 bool		hnswpushdownsearch(IndexScanDesc scan, ScanDirection direction, hook_evaluateTID evaluate, ExprState *qual, ExprContext  *econtext)

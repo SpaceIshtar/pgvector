@@ -13,7 +13,7 @@
  * Get the insert page
  */
 static BlockNumber
-GetInsertPage(Relation index)
+GetInsertPage(Relation index, BlockNumber* IPTRootPage)
 {
 	Buffer		buf;
 	Page		page;
@@ -26,6 +26,7 @@ GetInsertPage(Relation index)
 	metap = HnswPageGetMeta(page);
 
 	insertPage = metap->insertPage;
+	*IPTRootPage = metap->IPTrootPage;
 
 	UnlockReleaseBuffer(buf);
 
@@ -69,6 +70,10 @@ HnswFreeOffset(Relation index, Buffer buf, Page page, HnswElement element, Size 
 			}
 			else
 			{
+				if (neighborPage >= RelationGetNumberOfBlocks(index))
+				{
+					ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("blk is not valid")));
+				}
 				*nbuf = ReadBuffer(index, neighborPage);
 				LockBuffer(*nbuf, BUFFER_LOCK_EXCLUSIVE);
 
@@ -136,7 +141,7 @@ HnswInsertAppendPage(Relation index, Buffer *nbuf, Page *npage, GenericXLogState
  * Add to element and neighbor pages
  */
 static void
-AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, BlockNumber *updatedInsertPage, bool building)
+AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, BlockNumber IPTRootPage, BlockNumber *updatedInsertPage, BlockNumber *updatedIPTRootPage, bool building)
 {
 	Buffer		buf;
 	Page		page;
@@ -156,6 +161,7 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	BlockNumber newInsertPage = InvalidBlockNumber;
 	uint8		tupleVersion;
 	char	   *base = NULL;
+	ItemPointerData IPTkey, IPTvalue;
 
 	/* Calculate sizes */
 	etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(HnswPtrAccess(base, e->value)));
@@ -175,6 +181,12 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	/* Find a page (or two if needed) to insert the tuples */
 	for (;;)
 	{
+		if (currentPage >= RelationGetNumberOfBlocks(index))
+		{	
+			ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("blk is not valid")));
+		}
+
+
 		buf = ReadBuffer(index, currentPage);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
@@ -338,6 +350,10 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber insertPage, B
 	/* Update the insert page */
 	if (BlockNumberIsValid(newInsertPage) && newInsertPage != insertPage)
 		*updatedInsertPage = newInsertPage;
+
+	ItemPointerSet(&IPTkey, e->blkno, e->offno);
+	IPTvalue = e->heaptids[0];
+	IPTInsert(index, IPTRootPage, IPTkey, IPTvalue, updatedIPTRootPage);
 }
 
 /*
@@ -349,14 +365,14 @@ HnswLoadNeighbors(HnswElement element, Relation index, int m, int lm, int lc)
 	char	   *base = NULL;
 	HnswNeighborArray *neighbors = HnswInitNeighborArray(lm, NULL);
 	// ItemPointerData indextids[HNSW_MAX_M * 2];
-	HnswNeighborTidData indextids[HNSW_MAX_M * 2];
+	ItemPointerData indextids[HNSW_MAX_M * 2];
 
 	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
 		return neighbors;
 
 	for (int i = 0; i < lm; i++)
 	{
-		ItemPointer indextid = &indextids[i].indextid;
+		ItemPointer indextid = &indextids[i];
 		HnswElement e;
 		HnswCandidate *hc;
 
@@ -450,7 +466,7 @@ ConnectionExists(HnswElement e, HnswNeighborTuple ntup, int startIdx, int lm)
 {
 	for (int i = 0; i < lm; i++)
 	{
-		ItemPointer indextid = &ntup->indextids[startIdx + i].indextid;
+		ItemPointer indextid = &ntup->indextids[startIdx + i];
 
 		if (!ItemPointerIsValid(indextid))
 			break;
@@ -476,6 +492,10 @@ UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m
 	OffsetNumber offno = element->neighborOffno;
 
 	/* Register page */
+	if (element->neighborPage >= RelationGetNumberOfBlocks(index))
+	{
+		ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("blk is not valid")));
+	}
 	buf = ReadBuffer(index, element->neighborPage);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	if (building)
@@ -504,7 +524,7 @@ UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m
 		/* TODO Retry updating connections if not */
 		for (int j = 0; j < lm; j++)
 		{
-			if (!ItemPointerIsValid(&ntup->indextids[startIdx + j].indextid))
+			if (!ItemPointerIsValid(&ntup->indextids[startIdx + j]))
 			{
 				idx = startIdx + j;
 				break;
@@ -517,15 +537,11 @@ UpdateNeighborOnDisk(HnswElement element, HnswElement newElement, int idx, int m
 	/* Make robust to issues */
 	if (idx >= 0 && idx < ntup->count)
 	{
-		ItemPointer indextid = &ntup->indextids[idx].indextid;
+		ItemPointer indextid = &ntup->indextids[idx];
 
 		/* Update neighbor on the buffer */
 		ItemPointerSet(indextid, newElement->blkno, newElement->offno);
-		if (indextid->ip_blkid.bi_hi > 100)
-		{
-			elog(ERROR, "blk_hi too large");
-		}
-		ntup->indextids[idx].tabletid = newElement->heaptids[0];
+		
 
 		/* Commit */
 		if (building)
@@ -592,6 +608,10 @@ AddDuplicateOnDisk(Relation index, HnswElement element, HnswElement dup, bool bu
 	int			i;
 
 	/* Read page */
+	if (dup->blkno >= RelationGetNumberOfBlocks(index))
+	{
+		ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("blk is not valid")));
+	}
 	buf = ReadBuffer(index, dup->blkno);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	if (building)
@@ -669,24 +689,29 @@ static void
 UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, int m, int efConstruction, HnswElement entryPoint, bool building)
 {
 	BlockNumber newInsertPage = InvalidBlockNumber;
+	BlockNumber IPTRootPage = InvalidBlockNumber;
+	BlockNumber newIPTRootPage = InvalidBlockNumber;
+	BlockNumber insertPage = InvalidBlockNumber;
 
 	/* Look for duplicate */
-	if (FindDuplicateOnDisk(index, element, building))
-		return;
+	// if (FindDuplicateOnDisk(index, element, building))
+	// 	return;
+
+	insertPage = GetInsertPage(index, &IPTRootPage);
 
 	/* Add element */
-	AddElementOnDisk(index, element, m, GetInsertPage(index), &newInsertPage, building);
+	AddElementOnDisk(index, element, m, insertPage, IPTRootPage, &newInsertPage, &newIPTRootPage, building);
 
 	/* Update insert page if needed */
-	if (BlockNumberIsValid(newInsertPage))
-		HnswUpdateMetaPage(index, 0, NULL, newInsertPage, MAIN_FORKNUM, building);
+	if (BlockNumberIsValid(newInsertPage) || BlockNumberIsValid(newIPTRootPage))
+		HnswUpdateMetaPage(index, 0, NULL, newInsertPage, newIPTRootPage, MAIN_FORKNUM, building);
 
 	/* Update neighbors */
 	HnswUpdateNeighborsOnDisk(index, support, element, m, false, building);
 
 	/* Update entry point if needed */
 	if (entryPoint == NULL || element->level > entryPoint->level)
-		HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_GREATER, element, InvalidBlockNumber, MAIN_FORKNUM, building);
+		HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_GREATER, element, InvalidBlockNumber, InvalidBlockNumber, MAIN_FORKNUM, building);
 }
 
 /*
@@ -710,7 +735,7 @@ HnswInsertTupleOnDisk(Relation index, HnswSupport * support, Datum value, ItemPo
 	LockPage(index, HNSW_UPDATE_LOCK, lockmode);
 
 	/* Get m and entry point */
-	HnswGetMetaPageInfo(index, &m, &entryPoint);
+	HnswGetMetaPageInfo(index, &m, &entryPoint, NULL);
 
 	/* Create an element */
 	element = HnswInitElement(base, heaptid, m, HnswGetMl(m), HnswGetMaxLevel(m), NULL);

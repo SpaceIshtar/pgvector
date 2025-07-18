@@ -77,13 +77,21 @@ CreateMetaPage(HnswBuildState * buildstate)
 {
 	Relation	index = buildstate->index;
 	ForkNumber	forkNum = buildstate->forkNum;
-	Buffer		buf;
-	Page		page;
+	Buffer		buf, iptbuf;
+	Page		page, iptpage;
+	IPTNode		*node;
 	HnswMetaPage metap;
 
 	buf = HnswNewBuffer(index, forkNum);
 	page = BufferGetPage(buf);
 	HnswInitPage(buf, page);
+
+	iptbuf = IPTNewBuffer(index, forkNum);
+	iptpage = BufferGetPage(iptbuf);
+	IPTInitPage(iptbuf, iptpage);
+	node = ((IPTNode*) PageGetItem(iptpage, PageGetItemId(iptpage, FirstOffsetNumber)));
+	node->type = IPTNODE_LEAF;
+	node->num_keys = 0;
 
 	/* Set metapage data */
 	metap = HnswPageGetMeta(page);
@@ -96,11 +104,15 @@ CreateMetaPage(HnswBuildState * buildstate)
 	metap->entryOffno = InvalidOffsetNumber;
 	metap->entryLevel = -1;
 	metap->insertPage = InvalidBlockNumber;
+	metap->IPTrootPage = BufferGetBlockNumber(iptbuf);
+
 	((PageHeader) page)->pd_lower =
 		((char *) metap + sizeof(HnswMetaPageData)) - (char *) page;
 
 	MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
+	MarkBufferDirty(iptbuf);
+	UnlockReleaseBuffer(iptbuf);
 }
 
 /*
@@ -131,6 +143,27 @@ HnswBuildAppendPage(Relation index, Buffer *buf, Page *page, ForkNumber forkNum)
 	HnswInitPage(*buf, *page);
 }
 
+static BlockNumber GetIPTRootPage(Relation index)
+{
+	Buffer		buf;
+	Page		page;
+	HnswMetaPage metap;
+	BlockNumber insertPage;
+
+	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	metap = HnswPageGetMeta(page);
+
+	insertPage = metap->IPTrootPage;
+	
+
+	UnlockReleaseBuffer(buf);
+
+	return insertPage;
+}
+
+
 /*
  * Create graph pages
  */
@@ -148,7 +181,9 @@ CreateGraphPages(HnswBuildState * buildstate)
 	Page		page;
 	HnswElementPtr iter = buildstate->graph->head;
 	char	   *base = buildstate->hnswarea;
+	BlockNumber IPTRootPage = InvalidBlockNumber, updatedIPTRootPage = InvalidBlockNumber;
 
+	IPTRootPage = GetIPTRootPage(index);
 	/* Calculate sizes */
 	maxSize = HNSW_MAX_SIZE;
 
@@ -168,6 +203,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 		Size		ntupSize;
 		Size		combinedSize;
 		Pointer		valuePtr = HnswPtrAccess(base, element->value);
+		ItemPointerData IPTKey, IPTvalue;
 
 		/* Update iterator */
 		iter = element->next;
@@ -219,6 +255,15 @@ CreateGraphPages(HnswBuildState * buildstate)
 		/* Add placeholder for neighbors */
 		if (PageAddItem(page, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != element->neighborOffno)
 			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+
+		ItemPointerSet(&IPTKey, element->blkno, element->offno);
+		IPTvalue = element->heaptids[0];
+		IPTInsert(index, IPTRootPage, IPTKey, IPTvalue, &updatedIPTRootPage);
+		if (BlockNumberIsValid(updatedIPTRootPage))
+		{
+			IPTRootPage = updatedIPTRootPage;
+			updatedIPTRootPage = InvalidBlockNumber;
+		}
 	}
 
 	insertPage = BufferGetBlockNumber(buf);
@@ -228,7 +273,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 	UnlockReleaseBuffer(buf);
 
 	entryPoint = HnswPtrAccess(base, buildstate->graph->entryPoint);
-	HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, entryPoint, insertPage, forkNum, true);
+	HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, entryPoint, insertPage, IPTRootPage, forkNum, true);
 
 	pfree(etup);
 	pfree(ntup);
@@ -266,7 +311,10 @@ WriteNeighborTuples(HnswBuildState * buildstate)
 		/* Can take a while, so ensure we can interrupt */
 		/* Needs to be called when no buffer locks are held */
 		CHECK_FOR_INTERRUPTS();
-
+		if (element->neighborPage >= RelationGetNumberOfBlocks(index))
+		{
+			ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("blk is not valid")));
+		}
 		buf = ReadBufferExtended(index, forkNum, element->neighborPage, RBM_NORMAL, NULL);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		page = BufferGetPage(buf);
@@ -404,8 +452,8 @@ UpdateGraphInMemory(HnswSupport * support, HnswElement element, int m, int efCon
 	char	   *base = buildstate->hnswarea;
 
 	/* Look for duplicate */
-	if (FindDuplicateInMemory(base, element))
-		return;
+	// if (FindDuplicateInMemory(base, element))
+	// 	return;
 
 	/* Add element */
 	AddElementInMemory(base, graph, element);

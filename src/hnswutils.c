@@ -291,7 +291,7 @@ HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno)
  * Get the metapage info
  */
 void
-HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
+HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint, BlockNumber * IPTRootPage)
 {
 	Buffer		buf;
 	Page		page;
@@ -319,6 +319,11 @@ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
 			*entryPoint = NULL;
 	}
 
+	if (IPTRootPage != NULL)
+	{
+		*IPTRootPage = metap->IPTrootPage;
+	}
+
 	UnlockReleaseBuffer(buf);
 }
 
@@ -330,7 +335,7 @@ HnswGetEntryPoint(Relation index)
 {
 	HnswElement entryPoint;
 
-	HnswGetMetaPageInfo(index, NULL, &entryPoint);
+	HnswGetMetaPageInfo(index, NULL, &entryPoint, NULL);
 
 	return entryPoint;
 }
@@ -339,7 +344,7 @@ HnswGetEntryPoint(Relation index)
  * Update the metapage info
  */
 static void
-HnswUpdateMetaPageInfo(Page page, int updateEntry, HnswElement entryPoint, BlockNumber insertPage)
+HnswUpdateMetaPageInfo(Page page, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, BlockNumber IPTRootPage)
 {
 	HnswMetaPage metap = HnswPageGetMeta(page);
 
@@ -361,13 +366,16 @@ HnswUpdateMetaPageInfo(Page page, int updateEntry, HnswElement entryPoint, Block
 
 	if (BlockNumberIsValid(insertPage))
 		metap->insertPage = insertPage;
+
+	if (BlockNumberIsValid(IPTRootPage))
+		metap->IPTrootPage = IPTRootPage;
 }
 
 /*
  * Update the metapage
  */
 void
-HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building)
+HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, BlockNumber IPTRootPage, ForkNumber forkNum, bool building)
 {
 	Buffer		buf;
 	Page		page;
@@ -386,7 +394,7 @@ HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, Bloc
 		page = GenericXLogRegisterBuffer(state, buf, 0);
 	}
 
-	HnswUpdateMetaPageInfo(page, updateEntry, entryPoint, insertPage);
+	HnswUpdateMetaPageInfo(page, updateEntry, entryPoint, insertPage, IPTRootPage);
 
 	if (building)
 		MarkBufferDirty(buf);
@@ -461,33 +469,33 @@ HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m)
 
 		for (int i = 0; i < lm; i++)
 		{
-			// ItemPointer indextid = &ntup->indextids[idx++];
+			ItemPointer indextid = &ntup->indextids[idx++];
 
-			// if (i < neighbors->length)
-			// {
-			// 	HnswCandidate *hc = &neighbors->items[i];
-			// 	HnswElement hce = HnswPtrAccess(base, hc->element);
-
-			// 	ItemPointerSet(indextid, hce->blkno, hce->offno);
-			// }
-			// else
-			// 	ItemPointerSetInvalid(indextid);
 			if (i < neighbors->length)
 			{
 				HnswCandidate *hc = &neighbors->items[i];
 				HnswElement hce = HnswPtrAccess(base, hc->element);
-				ntup->indextids[idx].tabletid = hce->heaptids[0];
-				ItemPointerSet(&ntup->indextids[idx].indextid, hce->blkno, hce->offno);
-				if (ntup->indextids[idx].indextid.ip_blkid.bi_hi > 100)
-				{
-					elog(ERROR, "blk_hi too large");
-				}
-				idx++;
+
+				ItemPointerSet(indextid, hce->blkno, hce->offno);
 			}
-			else{
-				ItemPointerSetInvalid(&ntup->indextids[idx].tabletid);
-				ItemPointerSetInvalid(&ntup->indextids[idx++].indextid);	
-			}
+			else
+				ItemPointerSetInvalid(indextid);
+			// if (i < neighbors->length)
+			// {
+			// 	HnswCandidate *hc = &neighbors->items[i];
+			// 	HnswElement hce = HnswPtrAccess(base, hc->element);
+			// 	ntup->indextids[idx].tabletid = hce->heaptids[0];
+			// 	ItemPointerSet(&ntup->indextids[idx].indextid, hce->blkno, hce->offno);
+			// 	if (ntup->indextids[idx].indextid.ip_blkid.bi_hi > 100)
+			// 	{
+			// 		elog(ERROR, "blk_hi too large");
+			// 	}
+			// 	idx++;
+			// }
+			// else{
+			// 	ItemPointerSetInvalid(&ntup->indextids[idx].tabletid);
+			// 	ItemPointerSetInvalid(&ntup->indextids[idx++].indextid);	
+			// }
 		}
 	}
 
@@ -549,6 +557,10 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 	HnswElementTuple etup;
 
 	/* Read vector */
+	if (blkno >= RelationGetNumberOfBlocks(index))
+	{
+		ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("blk is not valid")));
+	}
 	buf = ReadBuffer(index, blkno);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
@@ -765,13 +777,17 @@ HnswLoadUnvisitedFromMemory(char *base, HnswElement element, HnswUnvisited * unv
  * Load neighbor index TIDs
  */
 bool
-HnswLoadNeighborTids(HnswElement element, HnswNeighborTidData *indextids, Relation index, int m, int lm, int lc)
+HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc)
 {
 	Buffer		buf;
 	Page		page;
 	HnswNeighborTuple ntup;
 	int			start;
 
+	if (element->neighborPage >= RelationGetNumberOfBlocks(index))
+	{
+		ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("blk is not valid")));
+	}
 	buf = ReadBuffer(index, element->neighborPage);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
@@ -790,8 +806,7 @@ HnswLoadNeighborTids(HnswElement element, HnswNeighborTidData *indextids, Relati
 
 	/* Copy to minimize lock time */
 	start = (element->level - lc) * m;
-	// memcpy(indextids, ntup->indextids + start, lm * sizeof(ItemPointerData));
-	memcpy(indextids, ntup->indextids + start, lm * sizeof(HnswNeighborTidData));
+	memcpy(indextids, ntup->indextids + start, lm * sizeof(ItemPointerData));
 
 	UnlockReleaseBuffer(buf);
 	return true;
@@ -803,7 +818,7 @@ HnswLoadNeighborTids(HnswElement element, HnswNeighborTidData *indextids, Relati
 static void
 HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc)
 {
-	HnswNeighborTidData indextids[HNSW_MAX_M * 2];
+	ItemPointerData indextids[HNSW_MAX_M * 2];
 
 	*unvisitedLength = 0;
 
@@ -812,7 +827,7 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 
 	for (int i = 0; i < lm; i++)
 	{
-		ItemPointer indextid = &indextids[i].indextid;
+		ItemPointer indextid = &indextids[i];
 		bool		found;
 
 		if (!ItemPointerIsValid(indextid))
@@ -932,7 +947,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			}
 			else
 			{
-				ItemPointer indextid = &unvisited[i].tid.indextid;
+				ItemPointer indextid = &unvisited[i].tid;
 				BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
 				OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
 
@@ -1001,7 +1016,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
  * Algorithm 2 from paper
  */
 List *
-HnswSearchLayerWithBitmap(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, itempointer_hash *bitmap, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples)
+HnswSearchLayerWithBitmap(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, itempointer_hash *bitmap, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, BlockNumber IPTRootPage)
 {
 	List	   *w = NIL;
 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
@@ -1100,7 +1115,8 @@ HnswSearchLayerWithBitmap(char *base, HnswQuery * q, List *ep, int ef, int lc, R
 			double		eDistance;
 			bool		alwaysAdd = wlen < ef;
 			double      random_num = RandomDouble();
-			bool        satisfy = itempointer_lookup(bitmap, unvisited[i].tid.tabletid);
+			ItemPointerData heaptid = IPTSearch(index, IPTRootPage, unvisited[i].tid);
+			bool        satisfy = itempointer_lookup(bitmap, heaptid);
 
 			if ((!satisfy) && random_num > alpha)
 			{
@@ -1119,7 +1135,7 @@ HnswSearchLayerWithBitmap(char *base, HnswQuery * q, List *ep, int ef, int lc, R
 			}
 			else
 			{
-				ItemPointer indextid = &unvisited[i].tid.indextid;
+				ItemPointer indextid = &unvisited[i].tid;
 				BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
 				OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
 
@@ -1198,7 +1214,7 @@ HnswSearchLayerWithBitmap(char *base, HnswQuery * q, List *ep, int ef, int lc, R
 }
 
 List *
-HnswPushDownSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, hook_evaluateTID evaluate_func, ExprState *qual, ExprContext *econtext, IndexScanDesc scan)
+HnswPushDownSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, hook_evaluateTID evaluate_func, ExprState *qual, ExprContext *econtext, IndexScanDesc scan, BlockNumber IPTRootPage)
 {
 	List	   *w = NIL;
 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
@@ -1215,6 +1231,7 @@ HnswPushDownSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Rel
 	bool		inMemory = index == NULL;
 
 	int 		length = 0;
+	ItemPointerData *reserved_ipd_list = palloc0(sizeof(ItemPointerData)*lm);
 	ItemPointer *reserved_itempointer_list = palloc0(sizeof(ItemPointer)*lm);
 	bool		*reserved_result_list = palloc0(sizeof(ItemPointer)*lm);
 	HnswSearchCandidate **reserved_candidate_lists = palloc0(sizeof(HnswSearchCandidate*)*lm);
@@ -1318,7 +1335,8 @@ HnswPushDownSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Rel
 			// OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
 			// HnswLoadElementImpl(blkno, offno, NULL, q, index, support, true, NULL, &eElement);
 			// unvisited[i].element = eElement;
-			reserved_itempointer_list[length] = &unvisited[i].tid.tabletid;
+			reserved_ipd_list[length] = IPTSearch(index, IPTRootPage, unvisited[i].tid);
+			reserved_itempointer_list[length] = &reserved_ipd_list[length]; // TODO
 			reserved_result_list[length] = false;
 			length++;
 		}
@@ -1346,7 +1364,7 @@ HnswPushDownSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Rel
 
 			
 			// eElement = unvisited[i].element;
-			indextid = &unvisited[i].tid.indextid;
+			indextid = &unvisited[i].tid;
 			HnswLoadElementImpl(ItemPointerGetBlockNumber(indextid), ItemPointerGetOffsetNumber(indextid), &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
 			// eDistance = GetElementDistance(base, eElement, q, support);
 			
